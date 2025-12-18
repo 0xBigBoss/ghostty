@@ -1832,6 +1832,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // only ever be looking at virtual placements that are in our
                 // viewport in the renderer and virtual placements only ever take
                 // up one row.
+                log.err("BUG: virtual placement pin outside viewport image_id={} placement_id={} pin.x={} pin.y={}", .{
+                    p.image_id,
+                    p.placement_id,
+                    rp.top_left.x,
+                    rp.top_left.y,
+                });
                 unreachable;
             };
 
@@ -1897,6 +1903,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 image.height;
 
             // Get the viewport-relative Y position of the placement.
+            const i32_max_u32: u32 = @intCast(std.math.maxInt(i32));
+            if (img_top_y > i32_max_u32 or img_bot_y > i32_max_u32 or
+                top_y > i32_max_u32 or bot_y > i32_max_u32)
+            {
+                log.warn(
+                    "kitty placement y overflow risk image_id={} img_top_y={} img_bot_y={} top_y={} bot_y={} rect_top_y={} rect_bot_y={} z={}",
+                    .{
+                        image.id,
+                        img_top_y,
+                        img_bot_y,
+                        top_y,
+                        bot_y,
+                        rect.top_left.y,
+                        rect.bottom_right.y,
+                        p.z,
+                    },
+                );
+            }
             const y_pos: i32 = @as(i32, @intCast(img_top_y)) - @as(i32, @intCast(top_y));
 
             // Accumulate the placement

@@ -3890,6 +3890,15 @@ pub fn getTopLeft(self: *const PageList, tag: point.Tag) Pin {
                 rem -= node.data.size.rows;
             }
 
+            log.err(
+                "BUG: getTopLeft active exhausted all pages rows={} remaining={} total_pages_first=0x{x} total_pages_last=0x{x}",
+                .{
+                    self.rows,
+                    rem,
+                    if (self.pages.first) |n| @intFromPtr(n) else 0,
+                    if (self.pages.last) |n| @intFromPtr(n) else 0,
+                },
+            );
             unreachable; // assertion: we always have enough rows for active
         },
     };
@@ -3911,7 +3920,55 @@ pub fn getBottomRight(self: *const PageList, tag: point.Tag) ?Pin {
 
         .viewport => viewport: {
             var br = self.getTopLeft(.viewport);
-            br = br.down(self.rows - 1).?;
+            const viewport_pin = self.viewport_pin.*;
+            if (self.rows == 0 or self.cols == 0) {
+                log.err(
+                    "BUG: getBottomRight viewport with zero dims rows={} cols={} viewport={} total_rows={} viewport_pin=(y={} x={} page_rows={} page_cols={}) viewport_pin_garbage={}",
+                    .{
+                        self.rows,
+                        self.cols,
+                        self.viewport,
+                        self.total_rows,
+                        viewport_pin.y,
+                        viewport_pin.x,
+                        viewport_pin.node.data.size.rows,
+                        viewport_pin.node.data.size.cols,
+                        viewport_pin.garbage,
+                    },
+                );
+            }
+            const down = br.down(self.rows - 1);
+            if (down == null) {
+                const first_ptr = if (self.pages.first) |node|
+                    @intFromPtr(node)
+                else
+                    0;
+                const last_ptr = if (self.pages.last) |node|
+                    @intFromPtr(node)
+                else
+                    0;
+                log.err(
+                    "BUG: getBottomRight viewport overflow rows={} cols={} total_rows={} viewport={} br=(y={} x={} page_rows={} page_cols={}) viewport_pin=(y={} x={} page_rows={} page_cols={}) viewport_pin_garbage={} pages.first=0x{x} pages.last=0x{x}",
+                    .{
+                        self.rows,
+                        self.cols,
+                        self.total_rows,
+                        self.viewport,
+                        br.y,
+                        br.x,
+                        br.node.data.size.rows,
+                        br.node.data.size.cols,
+                        viewport_pin.y,
+                        viewport_pin.x,
+                        viewport_pin.node.data.size.rows,
+                        viewport_pin.node.data.size.cols,
+                        viewport_pin.garbage,
+                        first_ptr,
+                        last_ptr,
+                    },
+                );
+            }
+            br = down.?;
             br.x = br.node.data.size.cols - 1;
             break :viewport br;
         },

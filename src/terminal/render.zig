@@ -15,6 +15,9 @@ const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Style = @import("style.zig").Style;
 const Terminal = @import("Terminal.zig");
+const log = std.log.scoped(.terminal_render);
+
+var row_iter_logged_once: bool = false;
 
 // Developer note: this is in src/terminal and not src/renderer because
 // the goal is that this remains generic to multiple renderers. This can
@@ -266,6 +269,22 @@ pub const RenderState = struct {
     ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
+        if (s.pages.rows == 0 or s.pages.cols == 0 or s.pages.viewport_pin.garbage) {
+            log.err(
+                "BUG: render update invalid viewport rows={} cols={} viewport={} total_rows={} viewport_pin=(y={} x={} page_rows={} page_cols={}) viewport_pin_garbage={}",
+                .{
+                    s.pages.rows,
+                    s.pages.cols,
+                    s.pages.viewport,
+                    s.pages.total_rows,
+                    viewport_pin.y,
+                    viewport_pin.x,
+                    viewport_pin.node.data.size.rows,
+                    viewport_pin.node.data.size.cols,
+                    s.pages.viewport_pin.garbage,
+                },
+            );
+        }
         const redraw = redraw: {
             // If our screen key changed, we need to do a full rebuild
             // because our render state is viewport-specific.
@@ -393,6 +412,24 @@ pub const RenderState = struct {
         var last_dirty_page: ?*page.Page = null;
 
         // Go through and setup our rows.
+        if (!row_iter_logged_once) {
+            log.err(
+                "BUG: render rowIterator call rows={} cols={} viewport={} total_rows={} viewport_pin=(y={} x={} page_rows={} page_cols={}) viewport_pin_garbage={} redraw={}",
+                .{
+                    s.pages.rows,
+                    s.pages.cols,
+                    s.pages.viewport,
+                    s.pages.total_rows,
+                    viewport_pin.y,
+                    viewport_pin.x,
+                    viewport_pin.node.data.size.rows,
+                    viewport_pin.node.data.size.cols,
+                    s.pages.viewport_pin.garbage,
+                    redraw,
+                },
+            );
+            row_iter_logged_once = true;
+        }
         var row_it = s.pages.rowIterator(
             .right_down,
             .{ .viewport = .{} },
