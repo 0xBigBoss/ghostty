@@ -817,11 +817,12 @@ pub const RenderState = struct {
         const row_cells = row_slice.items(.cells);
 
         // Grab our link ID
-        const link_page: *page.Page = &row_pins[viewport_point.y].node.data;
+        const link_pin = row_pins[viewport_point.y];
+        const link_page: *page.Page = &link_pin.node.data;
         const link = link: {
             const rac = link_page.getRowAndCell(
                 viewport_point.x,
-                viewport_point.y,
+                link_pin.y,
             );
 
             // The likely scenario is that our mouse isn't even over a link.
@@ -848,7 +849,7 @@ pub const RenderState = struct {
 
                 const other_page: *page.Page = &pin.node.data;
                 const other = link: {
-                    const rac = other_page.getRowAndCell(x, y);
+                    const rac = other_page.getRowAndCell(x, pin.y);
                     const link_id = other_page.lookupHyperlink(rac.cell) orelse continue;
                     break :link other_page.hyperlink_set.get(
                         other_page.memory,
