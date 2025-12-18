@@ -1288,6 +1288,96 @@ test "linkCells" {
     try testing.expectEqual(0, cells2.count());
 }
 
+test "linkCells with scrollback spanning pages" {
+    // Regression test for c02cf6418: linkCells passed viewport-relative y
+    // coordinates to Page.getRowAndCell, which expects page-relative coordinates.
+    // This caused an assertion failure when hovering over hyperlinks with
+    // large scrollback, as viewport_point.y could exceed page.size.rows.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Use std_capacity.cols (215) for deterministic page capacity
+    const viewport_rows: size.CellCountInt = 10;
+    const tail_rows: size.CellCountInt = 5; // Second page will have only 5 rows
+
+    // Guard: tail_rows must fit within viewport for mapping math to work
+    try testing.expect(tail_rows <= viewport_rows);
+
+    var t = try Terminal.init(alloc, .{
+        .cols = page.std_capacity.cols,
+        .rows = viewport_rows,
+        .max_scrollback = 10_000,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Get actual page capacity
+    const pages = &t.screens.active.pages;
+    const first_page = &pages.pages.first.?.data;
+    const first_page_cap = first_page.capacity.rows;
+
+    // Fill up first page completely (following pattern from search/pagelist.zig)
+    for (0..first_page_cap - 1) |_| {
+        try s.nextSlice("\r\n");
+    }
+
+    // Assert: still one page, and it's at capacity
+    try testing.expect(pages.pages.first == pages.pages.last);
+    try testing.expectEqual(first_page_cap, first_page.size.rows);
+
+    // Create second page with hyperlink on first row
+    try s.nextSlice("\r\n");
+
+    // Assert: now exactly two pages (first != last, and first.next == last)
+    try testing.expect(pages.pages.first != pages.pages.last);
+    try testing.expect(pages.pages.first.?.next == pages.pages.last);
+
+    // Write hyperlink on first row of second page (current cursor position)
+    try s.nextSlice("\x1b]8;;http://example.com\x1b\\LINK\x1b]8;;\x1b\\");
+
+    // Fill rest of tail_rows to control second page size
+    for (0..(tail_rows - 1)) |_| {
+        try s.nextSlice("\r\n");
+    }
+
+    // Assert: second page exists and has expected rows
+    const second_page = &pages.pages.first.?.next.?.data;
+    try testing.expectEqual(tail_rows, second_page.size.rows);
+
+    // Update render state - viewport is at bottom showing last viewport_rows
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // The hyperlink is on row 0 of second_page.
+    // With tail_rows=5 and viewport_rows=10, the viewport shows:
+    // - Rows from first page (viewport_rows - tail_rows = 5 rows)
+    // - All rows from second page (tail_rows = 5 rows)
+    // The hyperlink (second_page row 0) is at viewport row (viewport_rows - tail_rows) = 5
+    const expected_viewport_y: usize = viewport_rows - tail_rows;
+
+    // Verify pin mapping
+    const row_pins = state.row_data.slice().items(.pin);
+    const target_pin = row_pins[expected_viewport_y];
+    try testing.expectEqual(second_page, &target_pin.node.data);
+    try testing.expectEqual(@as(size.CellCountInt, 0), target_pin.y);
+
+    // Call linkCells at the computed viewport position
+    // Bug: getRowAndCell(x, 5) on page with 5 rows asserts (5 >= 5)
+    // Fix: getRowAndCell(x, 0) works correctly using pin.y
+    var cells = try state.linkCells(alloc, .{ .x = 0, .y = expected_viewport_y });
+    defer cells.deinit(alloc);
+
+    // Verify hyperlink was found: "LINK" = 4 cells
+    try testing.expectEqual(@as(usize, 4), cells.count());
+    try testing.expect(cells.contains(.{ .x = 0, .y = expected_viewport_y }));
+    try testing.expect(cells.contains(.{ .x = 1, .y = expected_viewport_y }));
+    try testing.expect(cells.contains(.{ .x = 2, .y = expected_viewport_y }));
+    try testing.expect(cells.contains(.{ .x = 3, .y = expected_viewport_y }));
+}
+
 test "string" {
     const testing = std.testing;
     const alloc = testing.allocator;
