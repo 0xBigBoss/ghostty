@@ -816,6 +816,13 @@ pub const RenderState = struct {
         const row_pins = row_slice.items(.pin);
         const row_cells = row_slice.items(.cells);
 
+        // During resize or render-state lag, the mouse viewport point may
+        // reference a row/column outside the current render-state grid.
+        // Return empty rather than panic on out-of-bounds access.
+        if (viewport_point.y >= row_pins.len or viewport_point.x >= self.cols) {
+            return result;
+        }
+
         // Grab our link ID
         const link_pin: PageList.Pin = row_pins[viewport_point.y];
         const link_page: *page.Page = &link_pin.node.data;
@@ -1286,6 +1293,50 @@ test "linkCells" {
     var cells2 = try state.linkCells(alloc, .{ .x = 4, .y = 0 });
     defer cells2.deinit(alloc);
     try testing.expectEqual(0, cells2.count());
+}
+
+test "linkCells out of bounds" {
+    // Regression test for crash when viewport point exceeds render-state grid.
+    // During resize or render-state lag, mouse viewport coordinates can
+    // reference rows/columns outside the current render-state bounds.
+    // linkCells must return empty rather than panic on OOB access.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    // Create a hyperlink so there's something to find if bounds were valid
+    try s.nextSlice("\x1b]8;;http://example.com\x1b\\LINK\x1b]8;;\x1b\\");
+    try state.update(alloc, &t);
+
+    // Y out of bounds: viewport_point.y >= rows (5 rows, query y=10)
+    // Before fix: panic at row_pins[viewport_point.y]
+    // After fix: returns empty CellSet
+    var cells_y_oob = try state.linkCells(alloc, .{ .x = 0, .y = 10 });
+    defer cells_y_oob.deinit(alloc);
+    try testing.expectEqual(0, cells_y_oob.count());
+
+    // X out of bounds: viewport_point.x >= cols (10 cols, query x=20)
+    // Before fix: would proceed to getRowAndCell with invalid x
+    // After fix: returns empty CellSet
+    var cells_x_oob = try state.linkCells(alloc, .{ .x = 20, .y = 0 });
+    defer cells_x_oob.deinit(alloc);
+    try testing.expectEqual(0, cells_x_oob.count());
+
+    // Both out of bounds
+    var cells_both_oob = try state.linkCells(alloc, .{ .x = 20, .y = 10 });
+    defer cells_both_oob.deinit(alloc);
+    try testing.expectEqual(0, cells_both_oob.count());
 }
 
 test "string" {
