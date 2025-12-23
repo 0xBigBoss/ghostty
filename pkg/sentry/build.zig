@@ -163,9 +163,9 @@ pub fn build(b: *std.Build) !void {
 
             .breakpad => {
                 lib.addCSourceFiles(.{
-                    .root = upstream.path(""),
+                    .root = b.path("."),
                     .files = &.{
-                        "src/backends/sentry_backend_breakpad.cpp",
+                        "patches/sentry_backend_breakpad.cpp",
                     },
                     .flags = flags.items,
                 });
