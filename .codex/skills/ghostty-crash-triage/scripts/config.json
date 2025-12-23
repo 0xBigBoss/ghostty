@@ -1,0 +1,10 @@
+{
+  "dsym_search_paths": [
+    "~/.ghostty-dsyms",
+    "macos/build/ReleaseLocal",
+    "/Applications/Ghostty.app/Contents/MacOS"
+  ],
+  "crash_dir": "~/.local/state/ghostty/crash",
+  "output_root": "bug-crash-reports",
+  "unsymbolicated_threshold": 0.5
+}
