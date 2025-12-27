@@ -854,6 +854,17 @@ pub fn resize(self: *PageList, opts: Resize) !void {
                 break :opts copy;
             });
             try self.resizeCols(cols, opts.cursor);
+
+            // Clamp viewport after resizeCols: reflow can change total_rows
+            // in ways that invalidate the viewport pin. This is needed here
+            // because resizeWithoutReflow already ran (with rows possibly
+            // shrinking), and resizeCols might have further reduced total_rows.
+            switch (self.viewport) {
+                .pin => if (self.pinIsActive(self.viewport_pin.*)) {
+                    self.viewport = .{ .active = {} };
+                },
+                .active, .top => {},
+            }
         },
     }
 }
@@ -987,6 +998,7 @@ fn resizeCols(
             req_rows -= 1;
         }
     }
+
 }
 
 // We use a cursor to track where we are in the src/dst. This is very
@@ -1670,6 +1682,19 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) !void {
                 // If we didn't trim enough, just modify our row count and this
                 // will create additional history.
                 self.rows = rows;
+
+                // Clamp the viewport if the pin is now in the active area.
+                // After shrinking rows (and possibly trimming total_rows), a
+                // previously-valid pin may end up inside the active area. If the
+                // pin is inside active, it cannot fit `rows` rows below it, so
+                // getBottomRight(.viewport) would overflow. Clamp to .active to
+                // prevent this.
+                switch (self.viewport) {
+                    .pin => if (self.pinIsActive(self.viewport_pin.*)) {
+                        self.viewport = .{ .active = {} };
+                    },
+                    .active, .top => {},
+                }
             },
 
             // Making rows larger we adjust our row count, and then grow
@@ -2320,6 +2345,13 @@ fn viewportRowOffset(self: *PageList) usize {
         .top => 0,
         .active => self.total_rows - self.rows,
         .pin => pin: {
+            // Note: getTopLeft/getBottomRight may fall back to active if the pin
+            // can't fit `rows` rows below it, but we can't add the same validation
+            // here because it breaks expected behavior after reflow (pinIsActive
+            // gives incorrect results when page structure changes, and down() has
+            // false negatives). The scrollbar may briefly show a stale position
+            // until a later clamp operation. This divergence is documented.
+            if (self.rows == 0) break :pin self.total_rows;
             // We assert integrity on this code path because it verifies
             // that the cached value is correct.
             defer self.assertIntegrity();
@@ -3880,7 +3912,18 @@ pub fn getTopLeft(self: *const PageList, tag: point.Tag) Pin {
         .viewport => switch (self.viewport) {
             .active => self.getTopLeft(.active),
             .top => self.getTopLeft(.screen),
-            .pin => self.viewport_pin.*,
+            .pin => pin: {
+                // Guard against zero-size viewport which would underflow rows - 1.
+                // Return screen top-left (not active, which also assumes rows > 0).
+                if (self.rows == 0) break :pin self.getTopLeft(.screen);
+                const vp = self.viewport_pin.*;
+                // If the pin can't fit `rows` rows below it, fall back to active.
+                // This ensures consistency with getBottomRight which also falls back.
+                if (vp.down(self.rows - 1) == null) {
+                    break :pin self.getTopLeft(.active);
+                }
+                break :pin vp;
+            },
         },
 
         // The active area is calculated backwards from the last page.
@@ -3919,8 +3962,28 @@ pub fn getBottomRight(self: *const PageList, tag: point.Tag) ?Pin {
         },
 
         .viewport => viewport: {
+            // Guard against zero-size viewport which would underflow rows - 1
+            if (self.rows == 0) {
+                const node = self.pages.last.?;
+                break :viewport .{
+                    .node = node,
+                    .y = node.data.size.rows - 1,
+                    .x = node.data.size.cols - 1,
+                };
+            }
             var br = self.getTopLeft(.viewport);
-            br = br.down(self.rows - 1).?;
+            // getTopLeft(.viewport) already validates the pin and falls back
+            // to active if invalid. This down() should always succeed, but
+            // fall back to screen bottom as ultimate safety.
+            const down = br.down(self.rows - 1) orelse {
+                const node = self.pages.last.?;
+                break :viewport .{
+                    .node = node,
+                    .y = node.data.size.rows - 1,
+                    .x = node.data.size.cols - 1,
+                };
+            };
+            br = down;
             br.x = br.node.data.size.cols - 1;
             break :viewport br;
         },
@@ -10849,4 +10912,126 @@ test "PageList resize reflow grapheme map capacity exceeded" {
 
     // Verify the resize succeeded
     try testing.expectEqual(@as(usize, 2), s.cols);
+}
+
+test "PageList resize (no reflow) shrink rows clamps viewport pin" {
+    // Regression: shrinking rows can leave a pinned viewport inside active
+    // with pin.y + rows > total_rows, so getBottomRight(.viewport) panics.
+    // Example: rows=76, total_rows=116, pin.y=46 => 46 + 75 > 115.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Create a PageList: 10 cols, 10 rows, unlimited scrollback for growth.
+    var s = try init(alloc, 10, 10, null);
+    defer s.deinit();
+
+    // Grow to create scrollback: 30 total rows, 10 visible.
+    for (0..20) |_| _ = try s.grow();
+    try testing.expectEqual(@as(usize, 10), s.rows);
+    try testing.expectEqual(@as(usize, 30), s.totalRows());
+
+    // Pin in history so viewport is .pin.
+    s.scroll(.{ .row = 15 });
+    try testing.expectEqual(Viewport.pin, s.viewport);
+
+    // Force an invalid pinned viewport (simulates stale pin after reflow).
+    s.viewport_pin.* = .{
+        .node = s.pages.last.?,
+        .y = 25,
+    };
+    s.viewport = .pin;
+
+    // Shrink rows and ensure viewport clamps to .active.
+    try s.resize(.{ .rows = 8, .reflow = false });
+
+    try testing.expectEqual(Viewport.active, s.viewport);
+
+    // Verify getBottomRight doesn't panic.
+    const br = s.getBottomRight(.viewport);
+    try testing.expect(br != null);
+}
+
+test "PageList resize reflow clamps viewport pin" {
+    // Regression: reflow can change total_rows and invalidate a pinned viewport.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Create a PageList with some content.
+    var s = try init(alloc, 10, 10, null);
+    defer s.deinit();
+
+    // Grow to create scrollback: 30 total rows, 10 visible.
+    for (0..20) |_| _ = try s.grow();
+    try testing.expectEqual(@as(usize, 10), s.rows);
+    try testing.expectEqual(@as(usize, 30), s.totalRows());
+
+    // Force a pinned viewport inside active.
+    s.viewport_pin.* = .{
+        .node = s.pages.last.?,
+        .y = 25,
+    };
+    s.viewport = .pin;
+
+    // Resize columns with reflow; pin should clamp to .active if invalid.
+    try s.resize(.{ .cols = 8, .reflow = true });
+
+    try testing.expectEqual(Viewport.active, s.viewport);
+
+    // Verify getBottomRight doesn't panic.
+    const br = s.getBottomRight(.viewport);
+    try testing.expect(br != null);
+}
+
+test "PageList resize reflow cols grow clamps viewport pin" {
+    // Regression: cols grow can unwrap rows, shrink total_rows, and invalidate a pin.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Create a PageList with 2 cols, 4 rows.
+    var s = try init(alloc, 2, 4, null);
+    defer s.deinit();
+
+    // Grow to create scrollback and wrap every other row pair.
+    try s.growRows(20);
+    try testing.expectEqual(@as(usize, 4), s.rows);
+    try testing.expectEqual(@as(usize, 24), s.totalRows());
+
+    // Set up wrapped rows in the page.
+    const page = &s.pages.last.?.data;
+    for (0..s.rows) |y| {
+        if (y % 2 == 0) {
+            const rac = page.getRowAndCell(0, y);
+            rac.row.wrap = true;
+        } else {
+            const rac = page.getRowAndCell(0, y);
+            rac.row.wrap_continuation = true;
+        }
+        for (0..s.cols) |x| {
+            const rac = page.getRowAndCell(x, y);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'A' },
+            };
+        }
+    }
+
+    // Pin viewport where reflow will move it inside active.
+    s.viewport_pin.* = .{
+        .node = s.pages.last.?,
+        .y = 20,
+    };
+    s.viewport = .pin;
+
+    // Resize columns with reflow (cols grow: 2 -> 4).
+    try s.resize(.{ .cols = 4, .reflow = true });
+
+    // Verify getBottomRight doesn't panic and returns valid result.
+    const br = s.getBottomRight(.viewport);
+    try testing.expect(br != null);
+
+    // Verify getTopLeft and getBottomRight are consistent.
+    const tl = s.getTopLeft(.viewport);
+    const tl_pt = s.pointFromPin(.screen, tl).?;
+    const br_pt = s.pointFromPin(.screen, br.?).?;
+    try testing.expectEqual(s.rows - 1, br_pt.screen.y - tl_pt.screen.y);
 }
