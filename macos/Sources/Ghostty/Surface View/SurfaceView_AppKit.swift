@@ -1436,8 +1436,15 @@ extension Ghostty {
             // in a row without storing it all.
             var item: NSMenuItem
 
-            // If we have a selection, add copy
-            if let text = self.accessibilitySelectedText(), text.count > 0 {
+            // If we have a non-empty selection, add look up, search, and copy
+            if let text = self.accessibilitySelectedText(), !text.isEmpty {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    let truncated = trimmed.count > 20 ? String(trimmed.prefix(20)) + "…" : trimmed
+                    menu.addItem(withTitle: "Look Up \"\(truncated)\"", action: #selector(lookUpSelection(_:)), keyEquivalent: "")
+                    let (searchEngineName, _) = defaultSearchEngine
+                    menu.addItem(withTitle: "Search \(searchEngineName) for \"\(truncated)\"", action: #selector(searchWeb(_:)), keyEquivalent: "")
+                }
                 menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
             }
             menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
@@ -1609,6 +1616,57 @@ extension Ghostty {
             if (!ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8)))) {
                 AppDelegate.logger.warning("action failed action=\(action)")
             }
+        }
+
+        @objc func lookUpSelection(_ sender: Any) {
+            guard let text = self.accessibilitySelectedText(), !text.isEmpty else { return }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let str = NSAttributedString(string: trimmed)
+            // Convert screen coordinates → window coordinates → view coordinates
+            guard let window = self.window else { return }
+            let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+            let viewPoint = self.convert(windowPoint, from: nil)
+            self.showDefinition(for: str, at: viewPoint)
+        }
+
+        /// Returns (displayName, searchURLPrefix) for the system default search engine
+        private var defaultSearchEngine: (name: String, urlPrefix: String) {
+            if let prefs = UserDefaults.standard.dictionary(forKey: "NSPreferredWebServices"),
+               let webSearch = prefs["NSWebServicesProviderWebSearch"] as? [String: Any],
+               let displayName = webSearch["NSDefaultDisplayName"] as? String,
+               let providerId = webSearch["NSProviderIdentifier"] as? String {
+                let urlPrefix: String
+                switch providerId {
+                case "com.duckduckgo":
+                    urlPrefix = "https://duckduckgo.com/?q="
+                case "com.bing":
+                    urlPrefix = "https://www.bing.com/search?q="
+                case "com.yahoo":
+                    urlPrefix = "https://search.yahoo.com/search?p="
+                case "org.ecosia":
+                    urlPrefix = "https://www.ecosia.org/search?q="
+                default:
+                    urlPrefix = "https://www.google.com/search?q="
+                }
+                return (displayName, urlPrefix)
+            }
+            return ("Google", "https://www.google.com/search?q=")
+        }
+
+        @objc func searchWeb(_ sender: Any) {
+            guard let text = self.accessibilitySelectedText(), !text.isEmpty else { return }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let (_, urlPrefix) = defaultSearchEngine
+            // Use URLComponents to properly encode the query parameter
+            guard let baseURL = URL(string: urlPrefix),
+                  var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { return }
+            // Extract existing query param name (q or p) and set value properly
+            let queryParamName = components.queryItems?.first?.name ?? "q"
+            components.queryItems = [URLQueryItem(name: queryParamName, value: trimmed)]
+            guard let url = components.url else { return }
+            NSWorkspace.shared.open(url)
         }
 
         @IBAction func changeTitle(_ sender: Any) {
