@@ -107,14 +107,7 @@ parts:
       - librsvg2-2
       - librsvg2-common
       - libgdk-pixbuf-2.0-0
-      - on amd64:
-          [
-            i965-va-driver,
-            libdrm-intel1,
-            libdrm-nouveau2,
-            libdrm-amdgpu1,
-            libdrm-radeon1,
-          ]
+      - on amd64: [i965-va-driver, libdrm-intel1, libdrm-nouveau2, libdrm-amdgpu1, libdrm-radeon1]
     stage:
       # The libraries in dri need no-patchelf, so they come from the mesa-unpatched part
       - -usr/lib/*/dri

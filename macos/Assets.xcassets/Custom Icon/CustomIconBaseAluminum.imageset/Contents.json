@@ -1,15 +1,15 @@
 {
-  "images" : [
+  "images": [
     {
-      "filename" : "base.png",
-      "idiom" : "universal"
+      "filename": "base.png",
+      "idiom": "universal"
     }
   ],
-  "info" : {
-    "author" : "xcode",
-    "version" : 1
+  "info": {
+    "author": "xcode",
+    "version": 1
   },
-  "properties" : {
-    "template-rendering-intent" : "original"
+  "properties": {
+    "template-rendering-intent": "original"
   }
 }

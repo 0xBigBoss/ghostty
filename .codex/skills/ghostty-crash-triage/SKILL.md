@@ -18,6 +18,7 @@ python .claude/skills/ghostty-crash-triage/scripts/triage.py
 ```
 
 This will:
+
 1. Select the newest crash file
 2. Extract the minidump and event metadata
 3. Search for a matching dSYM
@@ -41,15 +42,15 @@ python scripts/triage.py --dsym-search ~/my-dsyms
 
 After running triage, the output directory contains:
 
-| File | Description |
-|------|-------------|
-| `<id>.ghosttycrash` | Original crash envelope (copied) |
-| `<uuid>.dmp` | Extracted minidump |
-| `event_summary.json` | Parsed event metadata (release, OS, debug_id, etc.) |
-| `dsym_uuids.txt` | All discovered dSYM UUIDs for reference |
-| `lldb_bt.txt` | Symbolicated (or raw) backtrace from lldb |
-| `atos_bt.txt` | Fallback symbolication via atos (if dSYM unavailable) |
-| `REPORT.md` | Bug report skeleton to fill in |
+| File                 | Description                                           |
+| -------------------- | ----------------------------------------------------- |
+| `<id>.ghosttycrash`  | Original crash envelope (copied)                      |
+| `<uuid>.dmp`         | Extracted minidump                                    |
+| `event_summary.json` | Parsed event metadata (release, OS, debug_id, etc.)   |
+| `dsym_uuids.txt`     | All discovered dSYM UUIDs for reference               |
+| `lldb_bt.txt`        | Symbolicated (or raw) backtrace from lldb             |
+| `atos_bt.txt`        | Fallback symbolication via atos (if dSYM unavailable) |
+| `REPORT.md`          | Bug report skeleton to fill in                        |
 
 ## dSYM Archive Strategy
 
@@ -134,12 +135,12 @@ atos -o /path/to/ghostty -arch arm64 -l 0x100eec000 \
 
 ## Scripts
 
-| Script | Description |
-|--------|-------------|
-| `triage.py` | One-command orchestrator (recommended) |
-| `extract_sentry_envelope.py` | Parse `.ghosttycrash`, extract minidump |
-| `lldb_bt.sh` | Run lldb on a minidump, filter to frames |
-| `config.json` | Configuration for search paths and thresholds |
+| Script                       | Description                                   |
+| ---------------------------- | --------------------------------------------- |
+| `triage.py`                  | One-command orchestrator (recommended)        |
+| `extract_sentry_envelope.py` | Parse `.ghosttycrash`, extract minidump       |
+| `lldb_bt.sh`                 | Run lldb on a minidump, filter to frames      |
+| `config.json`                | Configuration for search paths and thresholds |
 
 ## Configuration
 
@@ -171,17 +172,17 @@ Ghostty uses GitHub Discussions as the first line of reporting for bugs and cras
 
 The discussion should include:
 
-| Section | Description |
-|---------|-------------|
-| Issue Description | Detailed description with root cause, trigger, Sentry UUID, and symbolicated stack trace |
-| Expected Behavior | What should happen (e.g., "empty slice should be a no-op") |
-| Actual Behavior | What actually happens (the crash) |
-| Reproduction Steps | Steps to trigger the crash |
-| Ghostty Logs | The panic message and relevant stack frames |
-| Ghostty Version | Output from `event_summary.json` or `ghostty +version` |
-| OS Version | From `event_summary.json` contexts.os |
-| Minimal Config | Configuration needed to reproduce (or "default") |
-| Fix (if available) | Commit hash and summary of the fix |
+| Section            | Description                                                                              |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| Issue Description  | Detailed description with root cause, trigger, Sentry UUID, and symbolicated stack trace |
+| Expected Behavior  | What should happen (e.g., "empty slice should be a no-op")                               |
+| Actual Behavior    | What actually happens (the crash)                                                        |
+| Reproduction Steps | Steps to trigger the crash                                                               |
+| Ghostty Logs       | The panic message and relevant stack frames                                              |
+| Ghostty Version    | Output from `event_summary.json` or `ghostty +version`                                   |
+| OS Version         | From `event_summary.json` contexts.os                                                    |
+| Minimal Config     | Configuration needed to reproduce (or "default")                                         |
+| Fix (if available) | Commit hash and summary of the fix                                                       |
 
 See `bug-crash-reports/2025-12-25/DISCUSSION.md` for an example.
 
@@ -216,10 +217,10 @@ mutation($repositoryId: ID!, $categoryId: ID!, $title: String!, $body: String!) 
 
 ### Reference IDs
 
-| ID | Description |
-|----|-------------|
-| `R_kgDOHFhdAg` | ghostty-org/ghostty repository ID |
-| `DIC_kwDOHFhdAs4Cmv-L` | Issue Triage category ID |
+| ID                     | Description                       |
+| ---------------------- | --------------------------------- |
+| `R_kgDOHFhdAg`         | ghostty-org/ghostty repository ID |
+| `DIC_kwDOHFhdAs4Cmv-L` | Issue Triage category ID          |
 
 ### Listing Categories
 

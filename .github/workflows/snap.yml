@@ -17,8 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          [namespace-profile-ghostty-snap, namespace-profile-ghostty-snap-arm64]
+        os: [namespace-profile-ghostty-snap, namespace-profile-ghostty-snap-arm64]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
