@@ -107,7 +107,7 @@ extension Ghostty {
         }
     }
 
-    enum SetSecureInput {
+    public enum SetSecureInput {
         case on
         case off
         case toggle

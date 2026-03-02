@@ -103,7 +103,7 @@ class TerminalWindow: NSWindow {
         }
 
         // All new windows are based on the app config at the time of creation.
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
+        guard let appDelegate = NSApp.delegate as? GhosttyAppActions else { return }
         let config = appDelegate.ghostty.config
 
         // Setup our initial config
@@ -144,6 +144,7 @@ class TerminalWindow: NSWindow {
             addTitlebarAccessoryViewController(resetZoomAccessory)
             resetZoomAccessory.view.translatesAutoresizingMaskIntoConstraints = false
 
+            #if !GHOSTTY_SPM_LIBRARY
             // Create update notification accessory
             if supportsUpdateAccessory {
                 updateAccessory.layoutAttribute = .right
@@ -154,6 +155,7 @@ class TerminalWindow: NSWindow {
                 addTitlebarAccessoryViewController(updateAccessory)
                 updateAccessory.view.translatesAutoresizingMaskIntoConstraints = false
             }
+            #endif
         }
 
         // Setup the accessory view for tabs that shows our keyboard shortcuts,
@@ -488,7 +490,7 @@ class TerminalWindow: NSWindow {
             backgroundColor = .white.withAlphaComponent(0.001)
 
             // We don't need to set blur when using glass
-            if !surfaceConfig.backgroundBlur.isGlassStyle, let appDelegate = NSApp.delegate as? AppDelegate {
+            if !surfaceConfig.backgroundBlur.isGlassStyle, let appDelegate = NSApp.delegate as? GhosttyAppActions {
                 ghostty_set_window_background_blur(
                     appDelegate.ghostty.app,
                     Unmanaged.passUnretained(self).toOpaque())
@@ -664,6 +666,7 @@ extension TerminalWindow {
         }
     }
 
+    #if !GHOSTTY_SPM_LIBRARY
     /// A pill-shaped button that displays update status and provides access to update actions.
     struct UpdateAccessoryView: View {
         @ObservedObject var viewModel: ViewModel
@@ -676,6 +679,7 @@ extension TerminalWindow {
                 .padding(.trailing, viewModel.accessoryTopPadding)
         }
     }
+    #endif
 
 }
 

@@ -640,15 +640,15 @@ extension Ghostty {
 
     /// The configuration for a surface. For any configuration not set, defaults will be chosen from
     /// libghostty, usually from the Ghostty configuration.
-    struct SurfaceConfiguration {
+    public struct SurfaceConfiguration {
         /// Explicit font size to use in points
-        var fontSize: Float32?
+        public var fontSize: Float32?
 
         /// Explicit working directory to set
-        var workingDirectory: String?
+        public var workingDirectory: String?
 
         /// Explicit command to set
-        var command: String?
+        public var command: String?
 
         /// Environment variables to set for the terminal
         var environmentVariables: [String: String] = [:]
@@ -662,7 +662,7 @@ extension Ghostty {
         /// Context for surface creation
         var context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_WINDOW
 
-        init() {}
+        public init() {}
 
         init(from config: ghostty_surface_config_s) {
             self.fontSize = config.font_size

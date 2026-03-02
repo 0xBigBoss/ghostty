@@ -26,7 +26,7 @@ import GhosttyKit
 ///
 /// The primary idea of all the behaviors we don't implement here are that subclasses may not
 /// want these behaviors.
-class BaseTerminalController: NSWindowController,
+open class BaseTerminalController: NSWindowController,
                               NSWindowDelegate,
                               TerminalViewDelegate,
                               TerminalViewModel,
@@ -112,7 +112,7 @@ class BaseTerminalController: NSWindowController,
         }
 
         // If the window one isn't set, we fallback to our global one.
-        if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+        if let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions {
             return appDelegate.undoManager
         }
 
@@ -128,7 +128,7 @@ class BaseTerminalController: NSWindowController,
         fatalError("init(coder:) is not supported for this view")
     }
 
-    init(_ ghostty: Ghostty.App,
+    public init(_ ghostty: Ghostty.App,
          baseConfig base: Ghostty.SurfaceConfiguration? = nil,
          surfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil
     ) {
@@ -1268,7 +1268,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? {
-        guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return nil }
+        guard let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions else { return nil }
         return appDelegate.undoManager
     }
 

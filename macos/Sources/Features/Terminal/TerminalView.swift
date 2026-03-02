@@ -107,6 +107,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                 // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
                 .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == "hidden" ? .top : [])
 
+                #if !GHOSTTY_SPM_LIBRARY
                 if let surfaceView = lastFocusedSurface?.value {
                     TerminalCommandPaletteView(
                         surfaceView: surfaceView,
@@ -116,17 +117,21 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         self.delegate?.performAction(action, on: surfaceView)
                     }
                 }
+                #endif
 
+                #if !GHOSTTY_SPM_LIBRARY
                 // Show update information above all else.
                 if viewModel.updateOverlayIsVisible {
                     UpdateOverlay()
                 }
+                #endif
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
         }
     }
 }
 
+#if !GHOSTTY_SPM_LIBRARY
 private struct UpdateOverlay: View {
     var body: some View {
         if let appDelegate = NSApp.delegate as? AppDelegate {
@@ -143,6 +148,7 @@ private struct UpdateOverlay: View {
         }
     }
 }
+#endif
 
 struct DebugBuildWarningView: View {
     @State private var isPopover = false

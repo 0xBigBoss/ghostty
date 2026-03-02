@@ -89,7 +89,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         // The app delegate is definitely setup by now. If it isn't our AppDelegate
         // then something is royally fucked up but protect against it anyhow.
-        guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else {
+        guard let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions else {
             completionHandler(nil, TerminalRestoreError.delegateInvalid)
             return
         }

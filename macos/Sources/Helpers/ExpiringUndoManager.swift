@@ -11,7 +11,7 @@
 ///     target.restorePreviousState()
 /// }
 /// ```
-class ExpiringUndoManager: UndoManager {
+public class ExpiringUndoManager: UndoManager {
     /// The set of expiring targets so we can properly clean them up when removeAllActions
     /// is called with the real target.
     private lazy var expiringTargets: Set<ExpiringTarget> = []

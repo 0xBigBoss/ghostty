@@ -7,7 +7,7 @@ import GhosttyKit
 
 extension Ghostty {
     /// The NSView implementation for a terminal surface.
-    class SurfaceView: OSView, ObservableObject, Codable, Identifiable {
+    public final class SurfaceView: OSView, ObservableObject, Codable, Identifiable {
         typealias ID = UUID
 
         /// Unique ID per surface
@@ -250,7 +250,7 @@ extension Ghostty {
             self.id = uuid ?? .init()
 
             // Our initial config always is our application wide config.
-            if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+            if let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions {
                 self.derivedConfig = DerivedConfig(appDelegate.ghostty.config)
             } else {
                 self.derivedConfig = DerivedConfig()
@@ -1498,7 +1498,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "copy_to_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1506,7 +1506,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "paste_from_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1514,7 +1514,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "paste_from_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1522,7 +1522,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "paste_from_selection"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1530,7 +1530,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "select_all"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1538,7 +1538,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "start_search"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1546,7 +1546,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "search_selection"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1554,7 +1554,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "scroll_to_selection"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1562,7 +1562,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "search:next"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1570,7 +1570,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "search:previous"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1578,7 +1578,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "end_search"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1586,7 +1586,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "toggle_readonly"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1622,7 +1622,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "reset"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1630,7 +1630,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "inspector:toggle"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                Ghostty.logger.warning("action failed action=\(action)")
             }
         }
 
@@ -1713,7 +1713,7 @@ extension Ghostty {
             // so we need @MainActor since we're reading/writing view state.
             UNUserNotificationCenter.current().add(request) { @MainActor error in
                 if let error = error {
-                    AppDelegate.logger.error("Error scheduling user notification: \(error)")
+                    Ghostty.logger.error("Error scheduling user notification: \(error)")
                     return
                 }
 
@@ -1787,7 +1787,7 @@ extension Ghostty {
         required convenience init(from decoder: Decoder) throws {
             // Decoding uses the global Ghostty app
             guard let del = NSApplication.shared.delegate,
-                  let appDel = del as? AppDelegate,
+                  let appDel = del as? GhosttyAppActions,
                   let app = appDel.ghostty.app else {
                 throw TerminalRestoreError.delegateInvalid
             }

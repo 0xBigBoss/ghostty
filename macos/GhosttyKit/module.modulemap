@@ -1,0 +1,4 @@
+module GhosttyKit [system] [extern_c] {
+    header "../../zig-out/include/ghostty.h"
+    export *
+}

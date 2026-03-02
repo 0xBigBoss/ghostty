@@ -10,11 +10,28 @@ protocol GhosttyAppDelegate: AnyObject {
     #endif
 }
 
+#if os(macOS)
+/// [fork-only] Protocol abstracting AppDelegate methods for GhosttySwift SPM consumers.
+/// Consumers conform their app delegate to this protocol.
+@MainActor
+public protocol GhosttyAppActions: AnyObject {
+    var ghostty: Ghostty.App { get }
+    var undoManager: ExpiringUndoManager { get }
+    func findSurface(forUUID uuid: UUID) -> Ghostty.SurfaceView?
+    func checkForUpdates(_ sender: Any?)
+    func closeAllWindows(_ sender: Any?)
+    func toggleVisibility(_ sender: Any)
+    func toggleQuickTerminal(_ sender: Any)
+    func setSecureInput(_ mode: Ghostty.SetSecureInput)
+    func syncFloatOnTopMenu(_ window: NSWindow?)
+}
+#endif
+
 extension Ghostty {
     // IMPORTANT: THIS IS NOT DONE.
     // This is a refactor/redo of Ghostty.AppState so that it supports both macOS and iOS
-    class App: ObservableObject {
-        enum Readiness: String {
+    public class App: ObservableObject {
+        public enum Readiness: String {
             case loading, error, ready
         }
 
@@ -22,18 +39,18 @@ extension Ghostty {
         weak var delegate: GhosttyAppDelegate?
 
         /// The readiness value of the state.
-        @Published var readiness: Readiness = .loading
+        @Published public var readiness: Readiness = .loading
 
         /// The global app configuration. This defines the app level configuration plus any behavior
         /// for new windows, tabs, etc. Note that when creating a new window, it may inherit some
         /// configuration (i.e. font size) from the previously focused window. This would override this.
-        @Published private(set) var config: Config
+        @Published public private(set) var config: Config
 
         /// Preferred config file than the default ones
         private var configPath: String?
         /// The ghostty app instance. We only have one of these for the entire app, although I guess
         /// in theory you can have multiple... I don't know why you would...
-        @Published var app: ghostty_app_t? {
+        @Published public var app: ghostty_app_t? {
             didSet {
                 guard let old = oldValue else { return }
                 ghostty_app_free(old)
@@ -41,7 +58,7 @@ extension Ghostty {
         }
 
         /// True if we need to confirm before quitting.
-        var needsConfirmQuit: Bool {
+        public var needsConfirmQuit: Bool {
             guard let app = app else { return false }
             return ghostty_app_needs_confirm_quit(app)
         }
@@ -686,7 +703,7 @@ extension Ghostty {
         private static func checkForUpdates(
             _ app: ghostty_app_t
         ) {
-            if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+            if let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions {
                 appDelegate.checkForUpdates(nil)
             }
         }
@@ -736,7 +753,7 @@ extension Ghostty {
             let undoManager: UndoManager?
             switch target.tag {
             case GHOSTTY_TARGET_APP:
-                undoManager = (NSApp.delegate as? AppDelegate)?.undoManager
+                undoManager = (NSApp.delegate as? GhosttyAppActions)?.undoManager
 
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return false }
@@ -757,7 +774,7 @@ extension Ghostty {
             let undoManager: UndoManager?
             switch target.tag {
             case GHOSTTY_TARGET_APP:
-                undoManager = (NSApp.delegate as? AppDelegate)?.undoManager
+                undoManager = (NSApp.delegate as? GhosttyAppActions)?.undoManager
 
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return false }
@@ -949,7 +966,7 @@ extension Ghostty {
         }
 
         private static func closeAllWindows(_ app: ghostty_app_t, target: ghostty_target_s) {
-            guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
+            guard let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions else { return }
             appDelegate.closeAllWindows(nil)
         }
 
@@ -1029,7 +1046,7 @@ extension Ghostty {
             _ app: ghostty_app_t,
             target: ghostty_target_s
         ) {
-            guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
+            guard let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions else { return }
             appDelegate.toggleVisibility(self)
         }
 
@@ -1415,7 +1432,7 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
 
                 // Determine if we even care about command finish notifications
-                guard let config = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config else { return }
+                guard let config = (NSApplication.shared.delegate as? GhosttyAppActions)?.ghostty.config else { return }
                 switch config.notifyOnCommandFinish {
                 case .never:
                     return
@@ -1505,7 +1522,7 @@ extension Ghostty {
                     window.level = window.level == .floating ? .normal : .floating
                 }
 
-                if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                if let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions {
                     appDelegate.syncFloatOnTopMenu(window)
                 }
 
@@ -1544,7 +1561,7 @@ extension Ghostty {
 
             switch target.tag {
             case GHOSTTY_TARGET_APP:
-                guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
+                guard let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions else { return }
                 appDelegate.setSecureInput(mode)
 
             case GHOSTTY_TARGET_SURFACE:
@@ -1573,7 +1590,7 @@ extension Ghostty {
             _ app: ghostty_app_t,
             target: ghostty_target_s
         ) {
-            guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
+            guard let appDelegate = NSApplication.shared.delegate as? GhosttyAppActions else { return }
             appDelegate.toggleQuickTerminal(self)
         }
 

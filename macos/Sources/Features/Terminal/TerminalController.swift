@@ -5,11 +5,11 @@ import Combine
 import GhosttyKit
 
 /// A classic, tabbed terminal experience.
-class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Controller {
+open class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Controller {
     override var windowNibName: NSNib.Name? {
         let defaultValue = "Terminal"
 
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return defaultValue }
+        guard let appDelegate = NSApp.delegate as? GhosttyAppActions else { return defaultValue }
         let config = appDelegate.ghostty.config
 
         // If we have no window decorations, there's no reason to do anything but
@@ -930,7 +930,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     static private func closeAllWindowsImmediately() {
-        let undoManager = (NSApp.delegate as? AppDelegate)?.undoManager
+        let undoManager = (NSApp.delegate as? GhosttyAppActions)?.undoManager
         undoManager?.beginUndoGrouping()
         all.forEach { $0.closeWindowImmediately() }
         undoManager?.setActionName("Close All Windows")
