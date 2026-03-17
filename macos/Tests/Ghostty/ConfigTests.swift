@@ -88,6 +88,45 @@ struct ConfigTests {
         #expect(config.windowTitleFontFamily == "Menlo")
     }
 
+    @Test func effectiveAppearanceUsesFallbackWhenWindowThemeIsSystem() throws {
+        let config = try TemporaryConfig("")
+        let appearance = NSAppearance.ghosttyEffectiveAppearance(
+            for: config,
+            fallback: NSAppearance(named: .darkAqua)!
+        )
+        #expect(appearance.ghosttyColorScheme == GHOSTTY_COLOR_SCHEME_DARK)
+    }
+
+    @Test func effectiveAppearanceUsesConfiguredLightWindowTheme() throws {
+        let config = try TemporaryConfig("window-theme = light")
+        let appearance = NSAppearance.ghosttyEffectiveAppearance(
+            for: config,
+            fallback: NSAppearance(named: .darkAqua)!
+        )
+        #expect(appearance.ghosttyColorScheme == GHOSTTY_COLOR_SCHEME_LIGHT)
+    }
+
+    @Test func effectiveAppearanceUsesConfiguredDarkWindowTheme() throws {
+        let config = try TemporaryConfig("window-theme = dark")
+        let appearance = NSAppearance.ghosttyEffectiveAppearance(
+            for: config,
+            fallback: NSAppearance(named: .aqua)!
+        )
+        #expect(appearance.ghosttyColorScheme == GHOSTTY_COLOR_SCHEME_DARK)
+    }
+
+    @Test func effectiveAppearanceUsesAutoWindowThemeDerivedFromBackground() throws {
+        let config = try TemporaryConfig("""
+        window-theme = auto
+        background = 000000
+        """)
+        let appearance = NSAppearance.ghosttyEffectiveAppearance(
+            for: config,
+            fallback: NSAppearance(named: .aqua)!
+        )
+        #expect(appearance.ghosttyColorScheme == GHOSTTY_COLOR_SCHEME_DARK)
+    }
+
     // MARK: - Enum Properties
 
     @Test func macosTitlebarStyleDefaultsToTransparent() throws {

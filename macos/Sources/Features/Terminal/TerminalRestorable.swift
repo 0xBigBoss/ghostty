@@ -64,6 +64,10 @@ class TerminalRestorableState: TerminalRestorable {
         self.tabColor = other.tabColor
         self.titleOverride = other.titleOverride
     }
+
+    var surfaceIDs: [String] {
+        surfaceTree.map(\.id.uuidString)
+    }
 }
 
 enum TerminalRestoreError: Error {
@@ -83,6 +87,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
     ) {
         // Verify the identifier is what we expect
         guard identifier == .init(String(describing: Self.self)) else {
+            AppDelegate.logger.warning("window restore skipped identifier=\(identifier.rawValue, privacy: .public) reason=identifier-unknown")
             completionHandler(nil, TerminalRestoreError.identifierUnknown)
             return
         }
@@ -99,15 +104,22 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // because window restoration is only ever invoked on app start so we
         // don't have to deal with config reloads.
         if appDelegate.ghostty.config.windowSaveState == "never" {
+            AppDelegate.logger.info("window restore skipped reason=window-save-state-never")
             completionHandler(nil, nil)
             return
         }
 
         // Decode the state. If we can't decode the state, then we can't restore.
         guard let state = TerminalRestorableState(coder: state) else {
+            AppDelegate.logger.warning("window restore skipped reason=state-decode-failed")
             completionHandler(nil, TerminalRestoreError.stateDecodeFailed)
             return
         }
+
+        let surfaceIDs = state.surfaceIDs.joined(separator: ",")
+        AppDelegate.logger.info(
+            "window restore request surfaces=\(surfaceIDs, privacy: .public) focused=\(state.focusedSurface ?? "-", privacy: .public)"
+        )
 
         // The window creation has to go through our terminalManager so that it
         // can be found for events from libghostty. This uses the low-level
@@ -117,9 +129,12 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             appDelegate.ghostty,
             withSurfaceTree: state.surfaceTree)
         guard let window = c.window else {
+            AppDelegate.logger.warning("window restore failed surfaces=\(surfaceIDs, privacy: .public) reason=window-did-not-load")
             completionHandler(nil, TerminalRestoreError.windowDidNotLoad)
             return
         }
+
+        AppDelegate.logger.info("window restore created surfaces=\(surfaceIDs, privacy: .public)")
 
         // Restore our tab color
         (window as? TerminalWindow)?.tabColor = state.tabColor
@@ -137,7 +152,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             }
 
             if let view = foundView {
-                c.focusedSurface = view
+                c.focusedSurfaceDidChange(to: view)
                 restoreFocus(to: view, inWindow: window)
             }
         }
@@ -189,4 +204,3 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         }
     }
 }
-

@@ -8,18 +8,15 @@ const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const EnvMap = std.process.EnvMap;
-const posix = std.posix;
 const termio = @import("../termio.zig");
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
 const terminalpkg = @import("../terminal/main.zig");
 const xev = @import("../global.zig").xev;
 const renderer = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
-const internal_os = @import("../os/main.zig");
-const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
+const persisted_scrollback = @import("persisted_scrollback.zig");
 
 const log = std.log.scoped(.io_exec);
 
@@ -70,6 +67,9 @@ last_cursor_reset: ?std.time.Instant = null,
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
+
+/// Persisted scrollback checkpoint state for manifest-based restore.
+persisted: ?PersistedState = null,
 
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
@@ -150,6 +150,63 @@ const ThreadEnterState = struct {
     };
 };
 
+const PersistedState = struct {
+    manifest_path: []u8,
+    session_id: ?[]u8,
+    limit: usize,
+    dirty: bool = false,
+    dirty_generation: u64 = 0,
+    notify_pending: bool = false,
+
+    fn init(
+        alloc: Allocator,
+        config: *const configpkg.Config,
+        session_id: ?[]const u8,
+    ) !?PersistedState {
+        const limit = config.@"scrollback-snapshot-limit";
+        if (limit == 0) {
+            log.debug("persisted scrollback save disabled reason=snapshot-limit-zero", .{});
+            return null;
+        }
+
+        const sid = session_id orelse {
+            log.debug("persisted scrollback save unavailable reason=no-session-id", .{});
+            return null;
+        };
+        if (sid.len == 0) {
+            log.debug("persisted scrollback save unavailable reason=empty-session-id", .{});
+            return null;
+        }
+
+        const manifest_path = try persisted_scrollback.manifestPath(alloc, sid);
+        errdefer alloc.free(manifest_path);
+
+        // Ensure the session directory exists so publish can write to it.
+        persisted_scrollback.ensureSessionDir(manifest_path) catch |err| {
+            log.warn("persisted scrollback save disabled reason=dir-create-failed err={}", .{err});
+            alloc.free(manifest_path);
+            return null;
+        };
+
+        log.debug(
+            "persisted scrollback save enabled path={s} limit={} session_id={s}",
+            .{ manifest_path, limit, sid },
+        );
+
+        return .{
+            .manifest_path = manifest_path,
+            .session_id = try alloc.dupe(u8, sid),
+            .limit = limit,
+        };
+    }
+
+    fn deinit(self: *PersistedState, alloc: Allocator) void {
+        alloc.free(self.manifest_path);
+        if (self.session_id) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 /// The configuration for this IO that is derived from the main
 /// configuration. This must be exported so that we don't need to
 /// pass around Config pointers which makes memory management a pain.
@@ -215,6 +272,172 @@ pub const DerivedConfig = struct {
     }
 };
 
+fn maybeLoadPersistedScrollback(
+    alloc: Allocator,
+    config: *const configpkg.Config,
+    session_id: ?[]const u8,
+) ?persisted_scrollback.Loaded {
+    const limit = config.@"scrollback-snapshot-limit";
+    if (limit == 0) {
+        log.info("persisted scrollback restore disabled reason=snapshot-limit-zero", .{});
+        return null;
+    }
+
+    const sid = session_id orelse {
+        log.info("persisted scrollback restore unavailable reason=no-session-id", .{});
+        return null;
+    };
+    if (sid.len == 0) {
+        log.info("persisted scrollback restore unavailable reason=empty-session-id", .{});
+        return null;
+    }
+
+    const path = persisted_scrollback.manifestPath(alloc, sid) catch |err| {
+        log.warn("persisted scrollback restore skipped reason=path-error err={}", .{err});
+        return null;
+    };
+    defer alloc.free(path);
+
+    // The per-surface byte budget is enforced during save, so the file
+    // size is inherently bounded. Use maxInt to avoid rejecting valid
+    // snapshots due to metadata size guesses — the allocator and OS
+    // provide the real memory bound.
+    const max_read = std.math.maxInt(usize);
+    const loaded = persisted_scrollback.load(alloc, path, max_read) catch |err| {
+        log.warn("persisted scrollback restore skipped path={s} err={}", .{ path, err });
+        return null;
+    };
+
+    log.info(
+        "persisted scrollback restore loaded path={s} rows={} cols={} primary_rows={} session_id_present={}",
+        .{
+            path,
+            loaded.header.rows,
+            loaded.header.cols,
+            loaded.primary.rows.len,
+            loaded.session_id != null,
+        },
+    );
+
+    return loaded;
+}
+
+fn restoredSessionLabel(alloc: Allocator, timestamp: i64) Allocator.Error![]u8 {
+    const secs: u64 = @intCast(@max(timestamp, 0));
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = secs };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const month_names = [_][]const u8{
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    };
+    const month_name = month_names[month_day.month.numeric() - 1];
+
+    return std.fmt.allocPrint(
+        alloc,
+        "[Restored {s} {d}, {d} at {d:0>2}:{d:0>2}:{d:0>2} UTC]",
+        .{
+            month_name,
+            month_day.day_index + 1,
+            year_day.year,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    );
+}
+
+fn restoredSessionMarker(
+    alloc: Allocator,
+    cols: usize,
+    timestamp: i64,
+) Allocator.Error![]u8 {
+    _ = cols;
+
+    const label = try restoredSessionLabel(alloc, timestamp);
+    defer alloc.free(label);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "\r\n\x1b[0m\x1b[2m");
+    try out.appendSlice(alloc, label);
+    try out.appendSlice(alloc, "\x1b[0m\r\n");
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn hydrateRestoredTerminal(
+    alloc: Allocator,
+    term: *terminalpkg.Terminal,
+    restored: persisted_scrollback.Loaded,
+) void {
+    const snapshot = terminalpkg.snapshot;
+
+    // Hydrate primary screen from binary snapshot data
+    const screen = term.screens.get(.primary) orelse term.screens.active;
+    snapshot.hydrateScreen(screen, restored.primary) catch |err| {
+        log.warn("persisted scrollback primary hydrate failed err={}", .{err});
+    };
+
+    // Hydrate alternate screen if present — must init it first since
+    // a fresh terminal only has the primary screen. Then switch to it
+    // so the terminal resumes on the same screen it was saved from.
+    if (restored.alternate) |alt_data| {
+        const alt_screen = term.screens.getInit(alloc, .alternate, .{
+            .cols = restored.header.cols,
+            .rows = restored.header.rows,
+        }) catch |err| {
+            log.warn("persisted scrollback alternate screen init failed err={}", .{err});
+            return;
+        };
+        snapshot.hydrateScreen(alt_screen, alt_data) catch |err| {
+            log.warn("persisted scrollback alternate hydrate failed err={}", .{err});
+        };
+        term.screens.switchTo(.alternate);
+    }
+
+    if (restored.pwd) |pwd| {
+        term.setPwd(pwd) catch |err| {
+            log.warn("persisted scrollback pwd hydrate failed err={}", .{err});
+        };
+    }
+
+    if (restored.title) |title| {
+        term.setTitle(title) catch |err| {
+            log.warn("persisted scrollback title hydrate failed err={}", .{err});
+        };
+    }
+
+    // Append session marker via VT replay (small, constant-size)
+    const marker = restoredSessionMarker(
+        alloc,
+        restored.header.cols,
+        restored.header.timestamp,
+    ) catch null;
+    if (marker) |line| {
+        defer alloc.free(line);
+        var replay: terminalpkg.TerminalStream = .initAlloc(
+            alloc,
+            .init(term),
+        );
+        defer replay.deinit();
+        replay.nextSlice(line);
+    }
+}
+
 /// Initialize the termio state.
 ///
 /// This will also start the child process if the termio is configured
@@ -237,12 +460,17 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         break :modes modes;
     };
 
-    // Create our terminal
+    var restored = maybeLoadPersistedScrollback(alloc, opts.full_config, opts.session_id);
+    defer if (restored) |*v| v.deinit(alloc);
+
+    // Create our terminal. If we restored persisted scrollback, initialize
+    // the terminal to the saved dimensions and let Surface.resize reflow
+    // to the current window size later in startup.
     var term = try terminalpkg.Terminal.init(alloc, opts: {
         const grid_size = opts.size.grid();
         break :opts .{
-            .cols = grid_size.columns,
-            .rows = grid_size.rows,
+            .cols = if (restored) |v| v.header.cols else grid_size.columns,
+            .rows = if (restored) |v| v.header.rows else grid_size.rows,
             .max_scrollback = opts.full_config.@"scrollback-limit",
             .default_modes = default_modes,
             .colors = .{
@@ -260,6 +488,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         };
     });
     errdefer term.deinit(alloc);
+
+    if (restored) |v| {
+        hydrateRestoredTerminal(alloc, &term, v);
+    }
 
     // Set our default cursor style
     term.screens.active.cursor.cursor_style = opts.config.cursor_style;
@@ -295,6 +527,12 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         opts.full_config,
     );
 
+    const persisted = try PersistedState.init(
+        alloc,
+        opts.full_config,
+        opts.session_id,
+    );
+
     self.* = .{
         .alloc = alloc,
         .terminal = term,
@@ -308,6 +546,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .mailbox = opts.mailbox,
         .terminal_stream = .initAlloc(alloc, handler),
         .thread_enter_state = thread_enter_state,
+        .persisted = persisted,
     };
 }
 
@@ -322,6 +561,7 @@ pub fn deinit(self: *Termio) void {
 
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
+    if (self.persisted) |*v| v.deinit(self.alloc);
 }
 
 pub fn threadEnter(
@@ -495,6 +735,8 @@ pub fn resize(
         if (self.terminal.modes.get(.in_band_size_reports)) {
             try self.sizeReportLocked(td, .mode_2048);
         }
+
+        self.markPersistedScrollbackDirtyLocked();
     }
 
     // Mail the renderer so that it can update the GPU and re-render
@@ -578,6 +820,7 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
                 .{ .all = true },
             );
 
+            self.markPersistedScrollbackDirtyLocked();
             return;
         }
 
@@ -589,6 +832,7 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // self.terminal.markSemanticPrompt(.command);
         // assert(!self.terminal.cursorIsAtPrompt());
         self.terminal.eraseDisplay(.complete, false);
+        self.markPersistedScrollbackDirtyLocked();
     }
 
     // If we reached here it means we're at a prompt, so we send a form-feed.
@@ -698,6 +942,94 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.handler.termio_messaged = false;
         self.mailbox.notify();
     }
+
+    self.markPersistedScrollbackDirtyLocked();
+}
+
+fn markPersistedScrollbackDirtyLocked(self: *Termio) void {
+    const persisted = if (self.persisted) |*value| value else return;
+
+    persisted.dirty = true;
+    persisted.dirty_generation +%= 1;
+    if (persisted.notify_pending) return;
+
+    persisted.notify_pending = true;
+    self.queueMessage(.{ .persisted_scrollback_dirty = {} }, .locked);
+}
+
+const PersistedCapture = struct {
+    generation: u64,
+    snapshot_data: []u8,
+
+    fn deinit(self: *PersistedCapture, alloc: Allocator) void {
+        alloc.free(self.snapshot_data);
+        self.* = undefined;
+    }
+};
+
+fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const persisted = if (self.persisted) |*value| value else return null;
+    persisted.notify_pending = false;
+    if (!persisted.dirty) return null;
+
+    const snapshot = terminalpkg.snapshot;
+    const primary = self.terminal.screens.get(.primary) orelse self.terminal.screens.active;
+    const alternate: ?*const terminalpkg.Screen = if (self.terminal.screens.active_key == .alternate)
+        self.terminal.screens.active
+    else
+        null;
+
+    var buf: std.Io.Writer.Allocating = .init(self.alloc);
+    defer buf.deinit();
+
+    try snapshot.write(self.alloc, &buf.writer, .{
+        .primary = primary,
+        .alternate = alternate,
+        .session_id = persisted.session_id,
+        .pwd = self.terminal.getPwd(),
+        .title = self.terminal.getTitle(),
+        .timestamp = std.time.timestamp(),
+        .max_bytes = persisted.limit,
+    });
+
+    // If the byte budget was too small to produce a snapshot with any
+    // rows, skip the flush to preserve any prior checkpoint on disk.
+    if (buf.writer.end == 0) return null;
+    const snapshot_bytes = buf.writer.buffer[0..buf.writer.end];
+    const has_content = blk: {
+        var parsed = snapshot.read(self.alloc, snapshot_bytes) catch break :blk false;
+        defer parsed.deinit(self.alloc);
+        const primary_rows = parsed.primary.rows.len;
+        const alt_rows = if (parsed.alternate) |a| a.rows.len else 0;
+        break :blk (primary_rows > 0 or alt_rows > 0);
+    };
+    if (!has_content) return null;
+
+    return .{
+        .generation = persisted.dirty_generation,
+        .snapshot_data = try buf.toOwnedSlice(),
+    };
+}
+
+pub fn flushPersistedScrollback(self: *Termio) !void {
+    var capture = (try self.capturePersistedScrollback()) orelse return;
+    defer capture.deinit(self.alloc);
+
+    const persisted = self.persisted orelse return;
+    try persisted_scrollback.publish(persisted.manifest_path, .{
+        .snapshot_data = capture.snapshot_data,
+    });
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    if (self.persisted) |*value| {
+        if (value.dirty_generation == capture.generation) {
+            value.dirty = false;
+        }
+    }
 }
 
 /// Sends a DSR response for the current color scheme to the pty.
@@ -754,4 +1086,95 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+test "restored session marker uses dim text" {
+    const testing = std.testing;
+
+    const marker = try restoredSessionMarker(testing.allocator, 48, 0);
+    defer testing.allocator.free(marker);
+
+    const expected = "\r\n\x1b[0m\x1b[2m[Restored Jan 1, 1970 at 00:00:00 UTC]\x1b[0m\r\n";
+
+    try testing.expectEqualStrings(expected, marker);
+}
+
+test "hydrateRestoredTerminal populates screen from snapshot" {
+    const testing = std.testing;
+    const snapshot = terminalpkg.snapshot;
+
+    // Create source terminal with content
+    var src_term = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 48,
+        .rows = 6,
+    });
+    defer src_term.deinit(testing.allocator);
+    {
+        const stream_terminal = @import("../terminal/stream_terminal.zig");
+        const handler: stream_terminal.Handler = .init(&src_term);
+        var stream: stream_terminal.Stream = .init(handler);
+        stream.nextSlice("hello world");
+    }
+
+    // Serialize
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    try snapshot.write(testing.allocator, &buf.writer, .{
+        .primary = &src_term.screens.active.*,
+        .timestamp = 0,
+    });
+    const data = try buf.toOwnedSlice();
+    defer testing.allocator.free(data);
+
+    // Parse
+    var restored = try snapshot.read(testing.allocator, data);
+    defer restored.deinit(testing.allocator);
+
+    // Create destination terminal and hydrate
+    var term = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 48,
+        .rows = 6,
+    });
+    defer term.deinit(testing.allocator);
+
+    hydrateRestoredTerminal(testing.allocator, &term, restored);
+
+    const primary = term.screens.get(.primary) orelse term.screens.active;
+    const screen = try primary.dumpStringAlloc(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(screen);
+
+    try testing.expect(std.mem.indexOf(u8, screen, "hello world") != null);
+    try testing.expect(std.mem.indexOf(u8, screen, "[Restored Jan 1, 1970 at 00:00:00 UTC]") != null);
+}
+
+test "maybeLoadPersistedScrollback leaves malformed manifests in place" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Create the session directory structure that manifestPath would produce.
+    try tmp_dir.dir.makePath("ghostty/session/test-session-uuid");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "ghostty/session/test-session-uuid/manifest",
+        .data = "invalid manifest payload",
+    });
+
+    const victim_path = try tmp_dir.dir.realpathAlloc(
+        testing.allocator,
+        "ghostty/session/test-session-uuid/manifest",
+    );
+    defer testing.allocator.free(victim_path);
+
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    config.@"scrollback-snapshot-limit" = 1024;
+
+    // Call load directly to verify the file is not deleted on parse failure.
+    try testing.expectError(
+        error.InvalidSnapshot,
+        persisted_scrollback.load(testing.allocator, victim_path, 1024),
+    );
+    // File should still exist after the failed load.
+    try std.fs.cwd().access(victim_path, .{});
 }

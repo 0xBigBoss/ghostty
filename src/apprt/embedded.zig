@@ -20,6 +20,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
+const persisted_scrollback = @import("../termio/persisted_scrollback.zig");
 
 const log = std.log.scoped(.embedded_window);
 
@@ -448,6 +449,9 @@ pub const Surface = struct {
         /// future once we have a concrete use case.
         command: ?[*:0]const u8 = null,
 
+        /// Stable UUID associated with this surface.
+        surface_uuid: ?[*:0]const u8 = null,
+
         /// Extra environment variables to set for the surface.
         env_vars: ?[*]EnvVar = null,
         env_var_count: usize = 0,
@@ -548,6 +552,23 @@ pub const Surface = struct {
             }
         }
 
+        // A stable TERM_SESSION_ID allows shell-level tooling to correlate
+        // state across restarts.
+        if (opts.surface_uuid) |c_uuid| {
+            const alloc = config.arenaAlloc();
+            const uuid = std.mem.sliceTo(c_uuid, 0);
+            if (uuid.len > 0) {
+                try config.env.map.put(
+                    alloc,
+                    try alloc.dupeZ(u8, "TERM_SESSION_ID"),
+                    try alloc.dupeZ(u8, uuid),
+                );
+            }
+        }
+
+        // Scrollback manifest path is now derived from surface_uuid in the
+        // Zig core (persisted_scrollback.manifestPath). No env var needed.
+
         // If we have an initial input then we set it.
         if (opts.initial_input) |c_input| {
             const alloc = config.arenaAlloc();
@@ -573,6 +594,13 @@ pub const Surface = struct {
             config.@"wait-after-command" = true;
         }
 
+        // Extract session ID before passing to core surface. This avoids
+        // routing the scrollback session identity through the config env map.
+        const session_id: ?[]const u8 = if (opts.surface_uuid) |c_uuid| blk: {
+            const uuid = std.mem.sliceTo(c_uuid, 0);
+            break :blk if (uuid.len > 0) uuid else null;
+        } else null;
+
         // Initialize our surface right away. We're given a view that is
         // ready to use.
         try self.core_surface.init(
@@ -581,6 +609,7 @@ pub const Surface = struct {
             app.core_app,
             app,
             self,
+            .{ .session_id = session_id },
         );
         errdefer self.core_surface.deinit();
 
@@ -1417,6 +1446,15 @@ pub const CAPI = struct {
         try app.init(core_app, config, opts.*);
         errdefer app.terminate();
 
+        // Clean up stale persisted scrollback sessions on startup.
+        // Sessions whose manifest hasn't been updated within the retention
+        // period are deleted. Active sessions stay fresh via the 300ms
+        // save timer. 7-day retention.
+        const retention: i64 = 7 * 24 * 60 * 60;
+        persisted_scrollback.cleanupStaleSessions(global.alloc, retention) catch |err| {
+            log.warn("stale session cleanup failed err={}", .{err});
+        };
+
         return app;
     }
 
@@ -2229,3 +2267,13 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "ghostty.h surface config has surface_uuid for session identity" {
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+
+    // The core derives the manifest path from surface_uuid using XDG
+    // state conventions. No separate manifest path field is needed.
+    try testing.expect(@hasField(c.ghostty_surface_config_s, "surface_uuid"));
+    try testing.expect(!@hasDecl(c, "ghostty_surface_export_snapshot"));
+}

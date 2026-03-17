@@ -39,3 +39,8 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Stable session identifier for persisted scrollback. When set, the core
+/// derives the manifest path from this ID using XDG state conventions.
+/// Provided by the apprt layer (e.g. the surface UUID on macOS).
+session_id: ?[]const u8 = null,

@@ -1012,7 +1012,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             } else if let focusedSurface = surfaceTree.first {
                 // No prior focused surface or we can't find it, let's focus
                 // the first.
-                self.focusedSurface = focusedSurface
+                self.focusedSurfaceDidChange(to: focusedSurface)
                 DispatchQueue.main.async {
                     Ghostty.moveFocus(to: focusedSurface, from: nil)
                 }
@@ -1055,6 +1055,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if restorable {
             window.restorationClass = TerminalWindowRestoration.self
             window.identifier = .init(String(describing: TerminalWindowRestoration.self))
+            AppDelegate.logger.info("window restoration enabled window=\(window.windowNumber)")
+        } else {
+            AppDelegate.logger.info("window restoration disabled window=\(window.windowNumber) reason=custom-command")
         }
 
         // If we have only a single surface (no splits) and there is a default size then
@@ -1062,7 +1065,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if case let .leaf(view) = surfaceTree.root {
             // If this is our first surface then our focused surface will be nil
             // so we force the focused surface to the leaf.
-            focusedSurface = view
+            focusedSurfaceDidChange(to: view)
         }
 
         // Initialize our content view to the SwiftUI root
@@ -1247,6 +1250,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     // window controller.
     func window(_ window: NSWindow, willEncodeRestorableState state: NSCoder) {
         let data = TerminalRestorableState(from: self)
+        let surfaceIDs = data.surfaceIDs.joined(separator: ",")
+        AppDelegate.logger.info(
+            "window encode restorable state window=\(window.windowNumber) surfaces=\(surfaceIDs, privacy: .public) focused=\(data.focusedSurface ?? "-", privacy: .public)"
+        )
         data.encode(with: state)
     }
 

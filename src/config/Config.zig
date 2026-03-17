@@ -2201,6 +2201,10 @@ keybind: Keybinds = .{},
 /// integration, such as preserving working directories. See `shell-integration`
 /// for more information.
 ///
+/// This option controls only the window geometry and layout restoration. It
+/// does not affect scrollback persistence, which is controlled independently
+/// by `scrollback-snapshot-limit`.
+///
 /// There are three valid values for this configuration:
 ///
 ///   * `default` will use the default system behavior. On macOS, this
@@ -2227,6 +2231,24 @@ keybind: Keybinds = .{},
 ///
 /// This is currently only supported on macOS. This has no effect on Linux.
 @"window-save-state": WindowSaveState = .default,
+
+/// The maximum scrollback checkpoint size in bytes that Ghostty will
+/// persist per surface. When a stable session identifier is available,
+/// Ghostty periodically saves a binary snapshot of the terminal
+/// scrollback to disk and restores it on next launch. This is
+/// independent of `window-save-state`.
+///
+/// Valid values are:
+///
+///   * `0` disables persisted scrollback checkpoints entirely.
+///   * Any positive value sets the byte cap per surface.
+///
+/// The default is 10MB (`10485760`).
+///
+/// This can be changed at runtime but will only affect newly saved state.
+///
+/// This is currently only supported on macOS. This has no effect on Linux.
+@"scrollback-snapshot-limit": usize = 10 * 1024 * 1024,
 
 /// Resize the window in discrete increments of the focused surface's cell size.
 /// If this is disabled, surfaces are resized in pixel increments. Currently

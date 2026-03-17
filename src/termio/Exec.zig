@@ -808,10 +808,12 @@ const Subprocess = struct {
         // Add the environment variables that override any others.
         {
             var it = cfg.env_override.iterator();
-            while (it.next()) |entry| try env.put(
-                entry.key_ptr.*,
-                entry.value_ptr.*,
-            );
+            while (it.next()) |entry| {
+                try env.put(
+                    entry.key_ptr.*,
+                    entry.value_ptr.*,
+                );
+            }
         }
 
         // Build our args list

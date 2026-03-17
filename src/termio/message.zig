@@ -36,6 +36,9 @@ pub const Message = union(enum) {
     /// Activate or deactivate the inspector.
     inspector: bool,
 
+    /// Mark persisted scrollback dirty and debounce a background flush.
+    persisted_scrollback_dirty: void,
+
     /// Resize the window.
     resize: renderer.Size,
 

@@ -39,6 +39,9 @@ const sync_reset_ms = 1000;
 /// The number of milliseconds between each movement during selection scrolling.
 const selection_scroll_ms = 15;
 
+/// The debounce interval for persisted scrollback manifest flushes.
+const persisted_scrollback_ms = 300;
+
 /// Allocator used for some state
 alloc: std.mem.Allocator,
 
@@ -71,6 +74,11 @@ coalesce_data: Coalesce = .{},
 sync_reset: xev.Timer,
 sync_reset_c: xev.Completion = .{},
 sync_reset_cancel_c: xev.Completion = .{},
+
+/// Debounced background flush for persisted scrollback manifests.
+persisted_scrollback: xev.Timer,
+persisted_scrollback_c: xev.Completion = .{},
+persisted_scrollback_cancel_c: xev.Completion = .{},
 
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
@@ -111,6 +119,10 @@ pub fn init(
     var sync_reset_h = try xev.Timer.init();
     errdefer sync_reset_h.deinit();
 
+    // This timer debounces persisted scrollback flushes.
+    var persisted_scrollback_h = try xev.Timer.init();
+    errdefer persisted_scrollback_h.deinit();
+
     return Thread{
         .alloc = alloc,
         .loop = loop,
@@ -118,6 +130,7 @@ pub fn init(
         .scroll = scroll_h,
         .coalesce = coalesce_h,
         .sync_reset = sync_reset_h,
+        .persisted_scrollback = persisted_scrollback_h,
     };
 }
 
@@ -127,6 +140,7 @@ pub fn deinit(self: *Thread) void {
     self.scroll.deinit();
     self.coalesce.deinit();
     self.sync_reset.deinit();
+    self.persisted_scrollback.deinit();
     self.stop.deinit();
     self.loop.deinit();
 }
@@ -318,6 +332,7 @@ fn drainMailbox(
                 try io.changeConfig(data, config.ptr);
             },
             .inspector => |v| self.flags.has_inspector = v,
+            .persisted_scrollback_dirty => self.startPersistedScrollbackTimer(cb),
             .resize => |v| self.handleResize(cb, v),
             .size_report => |v| try io.sizeReport(data, v),
             .clear_screen => |v| try io.clearScreen(data, v.history),
@@ -370,6 +385,18 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
         CallbackData,
         cb,
         syncResetCallback,
+    );
+}
+
+fn startPersistedScrollbackTimer(self: *Thread, cb: *CallbackData) void {
+    self.persisted_scrollback.reset(
+        &self.loop,
+        &self.persisted_scrollback_c,
+        &self.persisted_scrollback_cancel_c,
+        persisted_scrollback_ms,
+        CallbackData,
+        cb,
+        persistedScrollbackCallback,
     );
 }
 
@@ -464,7 +491,32 @@ fn stopCallback(
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     _ = r catch unreachable;
-    cb_.?.self.loop.stop();
+    const cb = cb_.?;
+    cb.io.flushPersistedScrollback() catch |err| {
+        log.warn("error flushing persisted scrollback during stop err={}", .{err});
+    };
+    cb.self.loop.stop();
+    return .disarm;
+}
+
+fn persistedScrollbackCallback(
+    cb_: ?*CallbackData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        error.Canceled => {},
+        else => {
+            log.warn("error during persisted scrollback callback err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const cb = cb_ orelse return .disarm;
+    cb.io.flushPersistedScrollback() catch |err| {
+        log.warn("error flushing persisted scrollback err={}", .{err});
+    };
     return .disarm;
 }
 

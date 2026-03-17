@@ -213,9 +213,11 @@ extension Ghostty {
         init(_ app: ghostty_app_t, baseConfig: SurfaceConfiguration? = nil, uuid: UUID? = nil) {
             self.markedText = NSMutableAttributedString()
 
+            let appConfig = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config
+
             // Our initial config always is our application wide config.
-            if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                self.derivedConfig = DerivedConfig(appDelegate.ghostty.config)
+            if let appConfig {
+                self.derivedConfig = DerivedConfig(appConfig)
             } else {
                 self.derivedConfig = DerivedConfig()
             }
@@ -341,7 +343,8 @@ extension Ghostty {
             ) { [weak self] event in self?.localEventHandler(event) }
 
             // Setup our surface. This will also initialize all the terminal IO.
-            let surface_cfg = baseConfig ?? SurfaceConfiguration()
+            var surface_cfg = baseConfig ?? SurfaceConfiguration()
+            surface_cfg.surfaceUUID = self.id.uuidString
             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                 ghostty_surface_new(app, &surface_cfg_c)
             }
@@ -350,6 +353,13 @@ extension Ghostty {
                 return
             }
             self.surfaceModel = Ghostty.Surface(cSurface: surface)
+
+            let initialAppearance = if let appConfig {
+                NSAppearance.ghosttyEffectiveAppearance(for: appConfig)
+            } else {
+                NSApplication.shared.effectiveAppearance
+            }
+            ghostty_surface_set_color_scheme(surface, initialAppearance.ghosttyColorScheme)
 
             // Setup our tracking area so we get mouse moved events
             updateTrackingAreas()
@@ -1775,13 +1785,25 @@ extension Ghostty {
             }
 
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            let uuid = UUID(uuidString: try container.decode(String.self, forKey: .uuid))
+            let uuidString = try container.decode(String.self, forKey: .uuid)
+            guard let uuid = UUID(uuidString: uuidString) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .uuid,
+                    in: container,
+                    debugDescription: "invalid surface UUID"
+                )
+            }
             var config = Ghostty.SurfaceConfiguration()
             config.workingDirectory = try container.decode(String?.self, forKey: .pwd)
             let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
 
+            AppDelegate.logger.info(
+                "surface restore preparing uuid=\(uuid.uuidString, privacy: .public)"
+            )
+
             self.init(app, baseConfig: config, uuid: uuid)
+            AppDelegate.logger.info("surface restore completed uuid=\(self.id.uuidString, privacy: .public)")
 
             // Restore the saved title after initialization
             if let title = savedTitle {

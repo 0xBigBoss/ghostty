@@ -3393,6 +3393,7 @@ pub const Surface = extern struct {
             app.core(),
             app.rt(),
             &priv.rt_surface,
+            .{},
         ) catch |err| {
             log.warn("failed to initialize surface err={}", .{err});
             return error.SurfaceError;

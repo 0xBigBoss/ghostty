@@ -471,6 +471,11 @@ pub fn init(
     app: *App,
     rt_app: *apprt.runtime.App,
     rt_surface: *apprt.runtime.Surface,
+    opts: struct {
+        /// Stable session identifier for persisted scrollback, provided
+        /// directly by the apprt layer (e.g. the surface UUID on macOS).
+        session_id: ?[]const u8 = null,
+    },
 ) !void {
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
@@ -489,6 +494,14 @@ pub fn init(
         // don't need to dupe memory here because termio will derive
         // it. We preserve this so directory inheritance works.
         c.@"working-directory" = config_original.@"working-directory";
+
+        // Preserve env vars set programmatically by the apprt layer
+        // (e.g. TERM_SESSION_ID for child process correlation). These
+        // are not config file directives so they are not captured in the
+        // replay steps that changeConditionalState rebuilds from.
+        // Note: scrollback session identity is passed directly via the
+        // opts.session_id parameter and does not depend on this.
+        c.env = config_original.env;
         break :config c;
     } else config_original;
 
@@ -682,6 +695,7 @@ pub fn init(
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .session_id = opts.session_id,
         });
     }
     // Outside the block, IO has now taken ownership of our temporary state

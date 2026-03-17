@@ -619,6 +619,9 @@ extension Ghostty {
         /// Explicit command to set
         var command: String?
 
+        /// Stable session UUID propagated to child env as TERM_SESSION_ID.
+        var surfaceUUID: String?
+
         /// Environment variables to set for the terminal
         var environmentVariables: [String: String] = [:]
 
@@ -640,6 +643,9 @@ extension Ghostty {
             }
             if let command = config.command {
                 self.command = String.init(cString: command, encoding: .utf8)
+            }
+            if let surfaceUUID = config.surface_uuid {
+                self.surfaceUUID = String.init(cString: surfaceUUID, encoding: .utf8)
             }
 
             // Convert the C env vars to Swift dictionary
@@ -699,27 +705,31 @@ extension Ghostty {
                     return try initialInput.withCString { cInput in
                         config.initial_input = cInput
 
-                        // Convert dictionary to arrays for easier processing
-                        let keys = Array(environmentVariables.keys)
-                        let values = Array(environmentVariables.values)
+                        return try surfaceUUID.withCString { cSurfaceUUID in
+                            config.surface_uuid = cSurfaceUUID
 
-                        // Create C strings for all keys and values
-                        return try keys.withCStrings { keyCStrings in
-                            return try values.withCStrings { valueCStrings in
-                                // Create array of ghostty_env_var_s
-                                var envVars = [ghostty_env_var_s]()
-                                envVars.reserveCapacity(environmentVariables.count)
-                                for i in 0..<environmentVariables.count {
-                                    envVars.append(ghostty_env_var_s(
-                                        key: keyCStrings[i],
-                                        value: valueCStrings[i]
-                                    ))
-                                }
+                            // Convert dictionary to arrays for easier processing
+                            let keys = Array(environmentVariables.keys)
+                            let values = Array(environmentVariables.values)
 
-                                return try envVars.withUnsafeMutableBufferPointer { buffer in
-                                    config.env_vars = buffer.baseAddress
-                                    config.env_var_count = environmentVariables.count
-                                    return try body(&config)
+                            // Create C strings for all keys and values
+                            return try keys.withCStrings { keyCStrings in
+                                return try values.withCStrings { valueCStrings in
+                                    // Create array of ghostty_env_var_s
+                                    var envVars = [ghostty_env_var_s]()
+                                    envVars.reserveCapacity(environmentVariables.count)
+                                    for i in 0..<environmentVariables.count {
+                                        envVars.append(ghostty_env_var_s(
+                                            key: keyCStrings[i],
+                                            value: valueCStrings[i]
+                                        ))
+                                    }
+
+                                    return try envVars.withUnsafeMutableBufferPointer { buffer in
+                                        config.env_vars = buffer.baseAddress
+                                        config.env_var_count = environmentVariables.count
+                                        return try body(&config)
+                                    }
                                 }
                             }
                         }

@@ -1015,9 +1015,17 @@ pub const StreamHandler = struct {
             // If we have a pwd then we set the title as the pwd else
             // we just set it to blank.
             if (self.terminal.getPwd()) |pwd| pwd: {
-                if (pwd.len >= buf.len) break :pwd;
+                if (pwd.len >= buf.len) {
+                    buf[0] = 0;
+                    try self.terminal.setTitle("");
+                    break :pwd;
+                }
                 @memcpy(buf[0..pwd.len], pwd);
                 buf[pwd.len] = 0;
+                try self.terminal.setTitle(pwd);
+            } else {
+                buf[0] = 0;
+                try self.terminal.setTitle("");
             }
 
             self.surfaceMessageWriter(.{ .set_title = buf });
@@ -1026,6 +1034,7 @@ pub const StreamHandler = struct {
         }
 
         self.seen_title = true;
+        try self.terminal.setTitle(title);
         self.surfaceMessageWriter(.{ .set_title = buf });
     }
 

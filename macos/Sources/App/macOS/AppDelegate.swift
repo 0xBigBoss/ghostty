@@ -302,6 +302,14 @@ class AppDelegate: NSObject,
             }
 
             ghostty_app_set_color_scheme(app, scheme)
+
+            // Surface trees track their own conditional theme state. Push the
+            // current system scheme into every live controller so restored
+            // windows don't depend on later focus/visibility churn to update.
+            TerminalController.all.forEach { $0.updateColorSchemeForSurfaceTree() }
+            if case .initialized(let quickController) = self.quickTerminalControllerState {
+                quickController.updateColorSchemeForSurfaceTree()
+            }
         }
 
         // Setup our menu
@@ -332,6 +340,9 @@ class AppDelegate: NSObject,
                 NSApp.arrangeInFront(nil)
             }
         }
+
+        // Stale session cleanup is now handled by the Zig core via
+        // time-based mtime checks — no Swift-side coordination needed.
     }
 
     func applicationDidHide(_ notification: Notification) {
