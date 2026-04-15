@@ -71,6 +71,9 @@ thread_enter_state: ?*ThreadEnterState = null,
 /// Persisted scrollback checkpoint state for manifest-based restore.
 persisted: ?PersistedState = null,
 
+/// Coordination state for bounded termination flushing.
+termination: TerminationState = .{},
+
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
 const ThreadEnterState = struct {
@@ -157,6 +160,9 @@ const PersistedState = struct {
     dirty: bool = false,
     dirty_generation: u64 = 0,
     notify_pending: bool = false,
+    dirty_started_at: ?std.time.Instant = null,
+    last_dirty_at: ?std.time.Instant = null,
+    retry_count: u8 = 0,
 
     fn init(
         alloc: Allocator,
@@ -206,6 +212,95 @@ const PersistedState = struct {
         self.* = undefined;
     }
 };
+
+pub const persisted_scrollback_debounce_ms = 400;
+const persisted_scrollback_max_staleness_ms = 2_000;
+const persisted_scrollback_retry_base_ms = 250;
+const persisted_scrollback_retry_cap_ms = 2_000;
+
+pub const TerminationResult = enum(u8) {
+    pending,
+    flushed,
+    flush_failed,
+    timed_out,
+};
+
+const TerminationState = struct {
+    mutex: std.Thread.Mutex = .{},
+    reset: std.Thread.ResetEvent = .{},
+    request_id: u64 = 0,
+    completed_id: u64 = 0,
+    result: TerminationResult = .pending,
+
+    fn begin(self: *TerminationState) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.request_id +%= 1;
+        self.completed_id = 0;
+        self.result = .pending;
+        self.reset = .{};
+        return self.request_id;
+    }
+
+    fn complete(
+        self: *TerminationState,
+        request_id: u64,
+        result: TerminationResult,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (request_id != self.request_id) return;
+        self.completed_id = request_id;
+        self.result = result;
+        self.reset.set();
+    }
+
+    fn wait(
+        self: *TerminationState,
+        request_id: u64,
+        timeout_ns: u64,
+    ) TerminationResult {
+        self.reset.timedWait(timeout_ns) catch return .timed_out;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.completed_id != request_id) return .timed_out;
+        return self.result;
+    }
+};
+
+const PersistedScheduleState = struct {
+    dirty: bool,
+    dirty_age_ms: u64,
+    idle_ms: u64,
+};
+
+const PersistedScheduleDecision = union(enum) {
+    none,
+    flush,
+    reschedule: u64,
+};
+
+fn persistedScrollbackScheduleDecision(
+    state: PersistedScheduleState,
+) PersistedScheduleDecision {
+    if (!state.dirty) return .none;
+    if (state.dirty_age_ms >= persisted_scrollback_max_staleness_ms) return .flush;
+    if (state.idle_ms >= persisted_scrollback_debounce_ms) return .flush;
+
+    const quiet_remaining = persisted_scrollback_debounce_ms - state.idle_ms;
+    const stale_remaining = persisted_scrollback_max_staleness_ms - state.dirty_age_ms;
+    return .{ .reschedule = @max(@as(u64, 1), @min(quiet_remaining, stale_remaining)) };
+}
+
+fn persistedScrollbackRetryDelayMs(retry_count: u8) u64 {
+    const shift = @min(retry_count, 3);
+    const delay = @as(u64, persisted_scrollback_retry_base_ms) << @intCast(shift);
+    return @min(delay, persisted_scrollback_retry_cap_ms);
+}
 
 /// The configuration for this IO that is derived from the main
 /// configuration. This must be exported so that we don't need to
@@ -623,6 +718,37 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
+pub fn prepareForQuit(
+    self: *Termio,
+    grace_ms: u32,
+    timeout_ms: u32,
+) bool {
+    const request_id = self.termination.begin();
+    self.queueMessage(.{ .prepare_termination = .{
+        .request_id = request_id,
+        .grace_ms = grace_ms,
+    } }, .unlocked);
+
+    const timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    const result = self.termination.wait(request_id, timeout_ns);
+    if (result == .timed_out) {
+        log.warn(
+            "termination flush timed out request_id={} timeout_ms={}",
+            .{ request_id, timeout_ms },
+        );
+    }
+
+    return result == .flushed;
+}
+
+pub fn completeTermination(
+    self: *Termio,
+    request_id: u64,
+    result: TerminationResult,
+) void {
+    self.termination.complete(request_id, result);
+}
+
 /// Send a message to the mailbox. Depending on the mailbox type in use
 /// this may process now or it may just enqueue and process later.
 ///
@@ -948,13 +1074,59 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
 
 fn markPersistedScrollbackDirtyLocked(self: *Termio) void {
     const persisted = if (self.persisted) |*value| value else return;
+    const now = std.time.Instant.now() catch return;
 
+    if (!persisted.dirty) persisted.dirty_started_at = now;
     persisted.dirty = true;
+    persisted.last_dirty_at = now;
     persisted.dirty_generation +%= 1;
     if (persisted.notify_pending) return;
 
     persisted.notify_pending = true;
     self.queueMessage(.{ .persisted_scrollback_dirty = {} }, .locked);
+}
+
+pub fn persistedScrollbackTimerDecision(self: *Termio) PersistedScheduleDecision {
+    const now = std.time.Instant.now() catch return .flush;
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const persisted = if (self.persisted) |*value| value else return .none;
+    if (!persisted.dirty) {
+        persisted.notify_pending = false;
+        return .none;
+    }
+
+    const dirty_started_at = persisted.dirty_started_at orelse now;
+    const last_dirty_at = persisted.last_dirty_at orelse dirty_started_at;
+    return persistedScrollbackScheduleDecision(.{
+        .dirty = persisted.dirty,
+        .dirty_age_ms = @intCast(now.since(dirty_started_at) / std.time.ns_per_ms),
+        .idle_ms = @intCast(now.since(last_dirty_at) / std.time.ns_per_ms),
+    });
+}
+
+pub fn persistedScrollbackFlushStarted(self: *Termio) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (self.persisted) |*value| value.notify_pending = false;
+}
+
+pub fn persistedScrollbackFlushFailed(self: *Termio) u64 {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const persisted = if (self.persisted) |*value| value else return persisted_scrollback_retry_cap_ms;
+    persisted.retry_count +%= 1;
+    persisted.notify_pending = true;
+    const delay = persistedScrollbackRetryDelayMs(persisted.retry_count - 1);
+    log.warn(
+        "persisted scrollback flush retry scheduled retry={} delay_ms={}",
+        .{ persisted.retry_count, delay },
+    );
+    return delay;
 }
 
 const PersistedCapture = struct {
@@ -972,7 +1144,6 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
     defer self.renderer_state.mutex.unlock();
 
     const persisted = if (self.persisted) |*value| value else return null;
-    persisted.notify_pending = false;
     if (!persisted.dirty) return null;
 
     const snapshot = terminalpkg.snapshot;
@@ -1026,8 +1197,11 @@ pub fn flushPersistedScrollback(self: *Termio) !void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     if (self.persisted) |*value| {
+        value.retry_count = 0;
         if (value.dirty_generation == capture.generation) {
             value.dirty = false;
+            value.dirty_started_at = null;
+            value.last_dirty_at = null;
         }
     }
 }
@@ -1177,4 +1351,53 @@ test "maybeLoadPersistedScrollback leaves malformed manifests in place" {
     );
     // File should still exist after the failed load.
     try std.fs.cwd().access(victim_path, .{});
+}
+
+test "persisted scrollback schedule waits for trailing debounce" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        PersistedScheduleDecision{ .reschedule = 300 },
+        persistedScrollbackScheduleDecision(.{
+            .dirty = true,
+            .dirty_age_ms = 100,
+            .idle_ms = 100,
+        }),
+    );
+}
+
+test "persisted scrollback schedule flushes at max staleness" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        PersistedScheduleDecision.flush,
+        persistedScrollbackScheduleDecision(.{
+            .dirty = true,
+            .dirty_age_ms = 2_000,
+            .idle_ms = 50,
+        }),
+    );
+}
+
+test "persisted scrollback schedule flushes after quiet debounce" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        PersistedScheduleDecision.flush,
+        persistedScrollbackScheduleDecision(.{
+            .dirty = true,
+            .dirty_age_ms = 500,
+            .idle_ms = 400,
+        }),
+    );
+}
+
+test "persisted scrollback retry delay backs off and caps" {
+    const testing = std.testing;
+
+    try testing.expectEqual(@as(u64, 250), persistedScrollbackRetryDelayMs(0));
+    try testing.expectEqual(@as(u64, 500), persistedScrollbackRetryDelayMs(1));
+    try testing.expectEqual(@as(u64, 1_000), persistedScrollbackRetryDelayMs(2));
+    try testing.expectEqual(@as(u64, 2_000), persistedScrollbackRetryDelayMs(3));
+    try testing.expectEqual(@as(u64, 2_000), persistedScrollbackRetryDelayMs(8));
 }

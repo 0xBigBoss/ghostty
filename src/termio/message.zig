@@ -39,6 +39,12 @@ pub const Message = union(enum) {
     /// Mark persisted scrollback dirty and debounce a background flush.
     persisted_scrollback_dirty: void,
 
+    /// Prepare the IO side of a surface for process termination.
+    prepare_termination: struct {
+        request_id: u64,
+        grace_ms: u32,
+    },
+
     /// Resize the window.
     resize: renderer.Size,
 

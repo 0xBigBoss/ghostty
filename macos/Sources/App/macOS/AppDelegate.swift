@@ -10,6 +10,9 @@ class AppDelegate: NSObject,
                     NSApplicationDelegate,
                     UNUserNotificationCenterDelegate,
                     GhosttyAppDelegate {
+    private static let terminateSurfaceGraceMs: UInt32 = 100
+    private static let terminateSurfaceTimeoutMs: UInt32 = 300
+
     // The application logger. We should probably move this at some point to a dedicated
     // class/struct but for now it lives here! 🤷‍♂️
     static let logger = Logger(
@@ -103,6 +106,7 @@ class AppDelegate: NSObject,
 
     /// The current state of the quick terminal.
     private var quickTerminalControllerState: QuickTerminalState = .uninitialized
+    private var hasPreparedSurfacesForTermination: Bool = false
 
     /// Our quick terminal. This starts out uninitialized and only initializes if used.
     var quickController: QuickTerminalController {
@@ -374,14 +378,20 @@ class AppDelegate: NSObject,
         return derivedConfig.shouldQuitAfterLastWindowClosed
     }
 
+    @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        func terminateNow() -> NSApplication.TerminateReply {
+            prepareSurfacesForTermination()
+            return .terminateNow
+        }
+
         let windows = NSApplication.shared.windows
-        if windows.isEmpty { return .terminateNow }
+        if windows.isEmpty { return terminateNow() }
 
         // If we've already accepted to install an update, then we don't need to
         // confirm quit. The user is already expecting the update to happen.
         if updateController.isInstalling {
-            return .terminateNow
+            return terminateNow()
         }
 
         // This probably isn't fully safe. The isEmpty check above is aspirational, it doesn't
@@ -392,7 +402,7 @@ class AppDelegate: NSObject,
         // here because I don't want to remove it in a patch release cycle but we should
         // target removing it soon.
         if (windows.allSatisfy { !$0.isVisible }) {
-            return .terminateNow
+            return terminateNow()
         }
 
         // If the user is shutting down, restarting, or logging out, we don't confirm quit.
@@ -405,7 +415,7 @@ class AppDelegate: NSObject,
             if let why = event.attributeDescriptor(forKeyword: keyword) {
                 switch why.typeCodeValue {
                 case kAEShutDown, kAERestart, kAEReallyLogOut:
-                    return .terminateNow
+                    return terminateNow()
 
                 default:
                     break
@@ -414,7 +424,7 @@ class AppDelegate: NSObject,
         }
 
         // If our app says we don't need to confirm, we can exit now.
-        if !ghostty.needsConfirmQuit { return .terminateNow }
+        if !ghostty.needsConfirmQuit { return terminateNow() }
 
         // We have some visible window. Show an app-wide modal to confirm quitting.
         let alert = NSAlert()
@@ -425,18 +435,57 @@ class AppDelegate: NSObject,
         alert.alertStyle = .warning
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            return .terminateNow
+            return terminateNow()
 
         default:
             return .terminateCancel
         }
     }
 
+    @MainActor
     func applicationWillTerminate(_ notification: Notification) {
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.
         UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+    }
+
+    @MainActor
+    private func prepareSurfacesForTermination() {
+        if hasPreparedSurfacesForTermination { return }
+        hasPreparedSurfacesForTermination = true
+
+        for surfaceView in terminalSurfaceViewsForTermination() {
+            let prepared = surfaceView.prepareForQuit(
+                graceMs: Self.terminateSurfaceGraceMs,
+                timeoutMs: Self.terminateSurfaceTimeoutMs
+            )
+            if !prepared {
+                Self.logger.warning(
+                    "surface termination flush did not complete surface=\(surfaceView.id.uuidString, privacy: .public) timeout_ms=\(Self.terminateSurfaceTimeoutMs)"
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private func terminalSurfaceViewsForTermination() -> [Ghostty.SurfaceView] {
+        var result: [Ghostty.SurfaceView] = []
+        var seen: Set<Ghostty.SurfaceView.ID> = []
+
+        for controller in TerminalController.all {
+            for surfaceView in controller.surfaceTree where seen.insert(surfaceView.id).inserted {
+                result.append(surfaceView)
+            }
+        }
+
+        if case .initialized(let controller) = quickTerminalControllerState {
+            for surfaceView in controller.surfaceTree where seen.insert(surfaceView.id).inserted {
+                result.append(surfaceView)
+            }
+        }
+
+        return result
     }
 
     /// This is called when the application is already open and someone double-clicks the icon

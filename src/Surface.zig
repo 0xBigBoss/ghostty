@@ -863,6 +863,14 @@ pub fn close(self: *Surface) void {
     self.rt_surface.close(self.needsConfirmQuit());
 }
 
+pub fn prepareForQuit(
+    self: *Surface,
+    grace_ms: u32,
+    timeout_ms: u32,
+) bool {
+    return self.io.prepareForQuit(grace_ms, timeout_ms);
+}
+
 /// Returns a mailbox that can be used to send messages to this surface.
 inline fn surfaceMailbox(self: *Surface) Mailbox {
     return .{

@@ -1597,6 +1597,14 @@ pub const CAPI = struct {
         ptr.app.closeSurface(ptr);
     }
 
+    export fn ghostty_surface_prepare_for_quit(
+        ptr: *Surface,
+        grace_ms: u32,
+        timeout_ms: u32,
+    ) bool {
+        return ptr.core().prepareForQuit(grace_ms, timeout_ms);
+    }
+
     /// Returns the userdata associated with the surface.
     export fn ghostty_surface_userdata(surface: *Surface) ?*anyopaque {
         return surface.userdata;

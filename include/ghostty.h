@@ -1103,6 +1103,9 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_prepare_for_quit(ghostty_surface_t,
+                                                  uint32_t,
+                                                  uint32_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
