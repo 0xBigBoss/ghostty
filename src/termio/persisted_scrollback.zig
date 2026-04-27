@@ -100,15 +100,23 @@ pub fn publish(
     }
 
     if (capture.rewrite_scrollback) {
+        // Rewrites are reserved for compaction-style captures where the
+        // in-memory history head moved behind the persisted log. The normal
+        // steady-state path below must only append new records.
         var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer buf.deinit();
         try writeScrollbackRecords(&buf.writer, capture.scrollback_first_seq, capture.scrollback_append);
         try writeFileAtomic(&dir, "scrollback", buf.writer.buffer[0..buf.writer.end]);
     } else if (capture.scrollback_append.len > 0) {
-        var file = try dir.createFile("scrollback", .{
-            .truncate = false,
-            .mode = 0o600,
-        });
+        // Open existing logs without truncation so each flush extends the
+        // append-only record stream. Create the file only for the first record.
+        var file = dir.openFile("scrollback", .{ .mode = .write_only }) catch |err| switch (err) {
+            error.FileNotFound => try dir.createFile("scrollback", .{
+                .truncate = false,
+                .mode = 0o600,
+            }),
+            else => return err,
+        };
         defer file.close();
         try file.seekFromEnd(0);
 
@@ -173,7 +181,7 @@ pub fn load(
     //   screen file seq = 13, rows = [9,10,11,12,13]
     // Rows 9 and 10 are already durable in the append-only log, so load
     // drops that screen prefix and materializes [scrollback...,11,12,13].
-    const screen_drop = duplicateScreenPrefix(screen_file.seq, screen_file.data.rows.len, scrollback_info.tail_seq);
+    const screen_drop = duplicateScreenPrefixForScrollback(screen_file.seq, screen_file.data.rows.len, scrollback_info);
     try builder.appendOwnedScreen(alloc, &screen_file.data, screen_drop);
     var primary = try builder.toOwned(alloc);
     errdefer primary.deinit(alloc);
@@ -188,7 +196,7 @@ pub fn load(
 
         var alt_builder: ScreenBuilder = try .init(alloc, header.cols);
         errdefer alt_builder.deinit(alloc);
-        const alt_drop = duplicateScreenPrefix(alt_file.seq, alt_file.data.rows.len, scrollback_info.tail_seq);
+        const alt_drop = duplicateScreenPrefixForScrollback(alt_file.seq, alt_file.data.rows.len, scrollback_info);
         try alt_builder.appendOwnedScreen(alloc, &alt_file.data, alt_drop);
         alternate = try alt_builder.toOwned(alloc);
     } else |err| switch (err) {
@@ -238,6 +246,7 @@ const ScreenFile = struct {
 
 const ScrollbackInfo = struct {
     tail_seq: u64 = 0,
+    has_records: bool = false,
 };
 
 const ScreenBuilder = struct {
@@ -449,7 +458,10 @@ fn readScrollback(
         pos += len;
     }
 
-    return .{ .tail_seq = prev_seq orelse 0 };
+    return .{
+        .tail_seq = prev_seq orelse 0,
+        .has_records = prev_seq != null,
+    };
 }
 
 fn duplicateScreenPrefix(screen_seq: u64, row_count: usize, scrollback_tail_seq: u64) usize {
@@ -457,6 +469,15 @@ fn duplicateScreenPrefix(screen_seq: u64, row_count: usize, scrollback_tail_seq:
     const first_seq = screen_seq -| (row_count - 1);
     if (scrollback_tail_seq < first_seq) return 0;
     return @min(row_count, scrollback_tail_seq - first_seq + 1);
+}
+
+fn duplicateScreenPrefixForScrollback(
+    screen_seq: u64,
+    row_count: usize,
+    scrollback_info: ScrollbackInfo,
+) usize {
+    if (!scrollback_info.has_records) return 0;
+    return duplicateScreenPrefix(screen_seq, row_count, scrollback_info.tail_seq);
 }
 
 fn writeLenPrefixed(writer: *std.Io.Writer, data: ?[]const u8) !void {
@@ -594,8 +615,10 @@ pub fn cleanupStaleSessions(alloc: Allocator, retention_seconds: i64) !void {
 
         const stat = sub.statFile("screen") catch |screen_err| switch (screen_err) {
             error.FileNotFound => sub.statFile("header") catch |header_err| switch (header_err) {
-                error.FileNotFound => sub.stat() catch |stat_err| {
-                    log.warn("stale session cleanup: cannot stat dir={s} err={}", .{ entry.name, stat_err });
+                error.FileNotFound => {
+                    dir.deleteTree(entry.name) catch |err| {
+                        log.warn("stale session cleanup: delete legacy dir={s} err={}", .{ entry.name, err });
+                    };
                     continue;
                 },
                 else => {
@@ -724,6 +747,36 @@ test "persisted scrollback binary snapshot roundtrip" {
     try testing.expectEqualStrings("test-session", loaded.session_id.?);
     try testing.expectEqualStrings("/tmp/test", loaded.pwd.?);
     try testing.expectEqualStrings("test title", loaded.title.?);
+    try testing.expectEqual(@as(usize, 24), loaded.primary.rows.len);
+}
+
+test "load returns full screen when scrollback is empty" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    var term = try terminalpkg.Terminal.init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(testing.allocator);
+
+    const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
+    defer testing.allocator.free(screen);
+
+    try publish(session_path, .{
+        .header = .{ .timestamp = 1, .cols = 80, .rows = 24 },
+        .screen = screen,
+        .screen_seq = 23,
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "session/scrollback", .data = "" });
+
+    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), loaded.scrollback_rows);
     try testing.expectEqual(@as(usize, 24), loaded.primary.rows.len);
 }
 
