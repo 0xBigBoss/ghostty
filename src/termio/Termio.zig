@@ -16,6 +16,7 @@ const xev = @import("../global.zig").xev;
 const renderer = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
+const internal_os = @import("../os/main.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const persisted_scrollback = @import("persisted_scrollback.zig");
 
@@ -1619,7 +1620,43 @@ fn applyPersistedPublishProgress(
     applyPersistedPartialPublishProgress(value, capture, progress);
 }
 
+const PersistedScrollbackFlushThread = struct {
+    io: *Termio,
+    err: ?anyerror = null,
+
+    fn run(self: *PersistedScrollbackFlushThread) void {
+        if (comptime builtin.target.os.tag == .macos) {
+            internal_os.macos.pthread_setname_np(&"persist-writer".*);
+
+            // Persistence writes are background work. Keep this off the IO
+            // thread so PTY writes retain their normal scheduler priority.
+            const class: internal_os.macos.QosClass = .utility;
+            if (internal_os.macos.setQosClass(class)) {
+                log.debug("persisted scrollback writer QoS class set class={}", .{class});
+            } else |err| {
+                log.warn("error setting persisted scrollback writer QoS class err={}", .{err});
+            }
+        }
+
+        self.io.flushPersistedScrollbackOnCurrentThread() catch |err| {
+            self.err = err;
+        };
+    }
+};
+
 pub fn flushPersistedScrollback(self: *Termio) !void {
+    if (comptime builtin.target.os.tag == .macos) {
+        var ctx: PersistedScrollbackFlushThread = .{ .io = self };
+        const thread = try std.Thread.spawn(.{}, PersistedScrollbackFlushThread.run, .{&ctx});
+        thread.join();
+        if (ctx.err) |err| return err;
+        return;
+    }
+
+    try self.flushPersistedScrollbackOnCurrentThread();
+}
+
+fn flushPersistedScrollbackOnCurrentThread(self: *Termio) !void {
     self.renderer_state.mutex.lock();
     if (self.persisted) |*persisted| {
         if (!persisted.dirty) {
