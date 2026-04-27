@@ -57,6 +57,13 @@ pub const WriteCapture = struct {
     max_bytes: usize = 0,
 };
 
+/// Input for writing a standalone screen block.
+pub const ScreenBlockCapture = struct {
+    screen: *const Screen,
+    start_row: u32 = 0,
+    row_count: ?u32 = null,
+};
+
 /// A single grapheme entry referencing a cell position.
 pub const GraphemeEntry = struct {
     row_index: u32,
@@ -243,6 +250,32 @@ fn writeCappedScreenBlock(
     try writer.writeAll(buf.writer.buffer[0..buf.writer.end]);
 }
 
+/// Return the number of rows currently represented by a screen.
+pub fn screenRowCount(screen: *const Screen) u32 {
+    var total_rows: u32 = 0;
+    var node_opt = screen.pages.pages.first;
+    while (node_opt) |node| : (node_opt = node.next) {
+        total_rows += node.data.size.rows;
+    }
+    return total_rows;
+}
+
+/// Serialize one standalone screen block using the existing ScreenData wire
+/// format. The caller may select a contiguous row range, but the row bytes
+/// themselves stay identical to the normal snapshot screen-block encoding.
+pub fn writeScreenData(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    capture: ScreenBlockCapture,
+) !void {
+    const total_rows = screenRowCount(capture.screen);
+    if (capture.start_row > total_rows) return error.InvalidDimensions;
+
+    const available = total_rows - capture.start_row;
+    const row_count = if (capture.row_count) |count| @min(count, available) else available;
+    try writeScreenBlockRange(alloc, writer, capture.screen, capture.start_row, row_count);
+}
+
 /// Estimate the maximum number of rows that fit in a byte budget.
 fn estimateMaxRows(screen: *const Screen, budget: usize) u32 {
     const screen_cols: usize = @intCast(screen.pages.cols);
@@ -261,20 +294,24 @@ fn writeScreenBlock(
     screen: *const Screen,
     max_rows: u32,
 ) !void {
-    const cols: u16 = @intCast(screen.pages.cols);
-
-    // Count total rows first so we know how many to skip.
-    var total_rows: u32 = 0;
-    {
-        var node_opt = screen.pages.pages.first;
-        while (node_opt) |node| : (node_opt = node.next) {
-            total_rows += node.data.size.rows;
-        }
-    }
+    const total_rows = screenRowCount(screen);
 
     // Limit rows: drop oldest (topmost) rows when max_rows is smaller.
     const rows_to_skip: u32 = if (max_rows < total_rows) total_rows - max_rows else 0;
     const rows_to_write = total_rows - rows_to_skip;
+
+    return writeScreenBlockRange(alloc, writer, screen, rows_to_skip, rows_to_write);
+}
+
+fn writeScreenBlockRange(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    screen: *const Screen,
+    start_row: u32,
+    rows_to_write: u32,
+) !void {
+    const cols: u16 = @intCast(screen.pages.cols);
+    const end_row = start_row + rows_to_write;
 
     // Build style table only from rows that will actually be written.
     var style_table: StyleTable = .init();
@@ -287,7 +324,7 @@ fn writeScreenBlock(
             const page = &node.data;
             var y: usize = 0;
             while (y < page.size.rows) : (y += 1) {
-                if (scan_row >= rows_to_skip) {
+                if (scan_row >= start_row and scan_row < end_row) {
                     const row = page.getRow(y);
                     const cells = page.getCells(row);
                     for (cells) |cell| {
@@ -328,11 +365,11 @@ fn writeScreenBlock(
             const page = &node.data;
             var y: usize = 0;
             while (y < page.size.rows) : (y += 1) {
-                // Skip oldest rows to fit within byte budget
-                if (global_row < rows_to_skip) {
+                if (global_row < start_row) {
                     global_row += 1;
                     continue;
                 }
+                if (global_row >= end_row) break;
 
                 const row = page.getRow(y);
                 const cells = page.getCells(row);
@@ -635,6 +672,15 @@ fn readScreenBlock(alloc: Allocator, cursor: *ReadCursor) (Allocator.Error || Er
         .graphemes = graphemes_buf,
         .cols = cols,
     };
+}
+
+/// Deserialize one standalone screen block written by `writeScreenData`.
+pub fn readScreenData(alloc: Allocator, data: []const u8) (Allocator.Error || Error)!ScreenData {
+    var cursor: ReadCursor = .{ .data = data };
+    var result = try readScreenBlock(alloc, &cursor);
+    errdefer result.deinit(alloc);
+    if (cursor.remaining() != 0) return error.InvalidSnapshot;
+    return result;
 }
 
 fn readStyle(cursor: *ReadCursor) Error!Style {

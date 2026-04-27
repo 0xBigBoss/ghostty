@@ -1087,6 +1087,13 @@ GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
 GHOSTTY_API void ghostty_app_free(ghostty_app_t);
 GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
+/// Flush all dirty persisted-scrollback pages across every surface.
+/// Bounded by `timeout_ms` total; surfaces beyond the budget are skipped and
+/// warn-logged. Safe to call from any thread.
+///
+/// macOS apprts should call this from application termination handlers with
+/// timeout_ms <= 1500 so the Zig core enforces the shutdown bound.
+GHOSTTY_API void ghostty_app_persist_all(ghostty_app_t, uint32_t timeout_ms);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);

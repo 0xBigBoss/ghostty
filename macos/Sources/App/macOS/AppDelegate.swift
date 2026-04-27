@@ -12,6 +12,7 @@ class AppDelegate: NSObject,
                     GhosttyAppDelegate {
     private static let terminateSurfaceGraceMs: UInt32 = 100
     private static let terminateSurfaceTimeoutMs: UInt32 = 300
+    private static let terminateFlushTimeoutMs: UInt32 = 500
 
     // The application logger. We should probably move this at some point to a dedicated
     // class/struct but for now it lives here! 🤷‍♂️
@@ -444,6 +445,18 @@ class AppDelegate: NSObject,
 
     @MainActor
     func applicationWillTerminate(_ notification: Notification) {
+        // Last-chance safety net: flush any dirty persisted-scrollback
+        // pages for surfaces that did not go through the bounded-quit
+        // path (signal-driven termination, windowless states).
+        // prepareSurfacesForTermination already does per-surface flushes
+        // via prepareForQuit on the graceful path; this covers the rest.
+        //
+        // The Zig core enforces the bound; see ghostty_app_persist_all
+        // in src/apprt/embedded.zig. Surfaces beyond the budget are
+        // skipped and warn-logged. Safe to call from the main thread
+        // because the surface list is mutex-protected.
+        ghostty.persistAll(timeoutMs: Self.terminateFlushTimeoutMs)
+
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.

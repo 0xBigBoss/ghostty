@@ -123,6 +123,11 @@ extension Ghostty {
             ghostty_app_tick(app)
         }
 
+        func persistAll(timeoutMs: UInt32) {
+            guard let app = self.app else { return }
+            ghostty_app_persist_all(app, timeoutMs)
+        }
+
         static func openConfig() {
             let str = Ghostty.AllocatedString(ghostty_config_open_path()).string
             guard !str.isEmpty else { return }
