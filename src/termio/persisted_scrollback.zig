@@ -17,7 +17,9 @@ const header_size: usize = 23;
 const screen_prefix_size: usize = 14;
 const scrollback_record_prefix_size: usize = 12;
 
-pub const stale_session_retention_seconds: i64 = 7 * 24 * 60 * 60;
+pub const default_stale_session_retention_days: u32 = 7;
+pub const max_stale_session_retention_days: u32 = 365;
+pub const stale_session_retention_seconds: i64 = retentionSecondsFromDays(default_stale_session_retention_days);
 pub const stale_session_cleanup_interval_ms: u64 = 60 * 60 * 1000;
 const stale_session_close_cleanup_min_interval_seconds: i64 = 5 * 60;
 const write_telemetry_report_interval_seconds: i64 = 60;
@@ -27,6 +29,11 @@ var stale_session_close_cleanup_last_timestamp: std.atomic.Value(i64) = .init(0)
 var write_telemetry_bytes: std.atomic.Value(u64) = .init(0);
 var write_telemetry_last_report_timestamp: std.atomic.Value(i64) = .init(0);
 var write_telemetry_active_sessions: std.atomic.Value(usize) = .init(0);
+
+pub fn retentionSecondsFromDays(days: u32) i64 {
+    const clamped_days: i64 = @intCast(@min(days, max_stale_session_retention_days));
+    return clamped_days * 24 * 60 * 60;
+}
 
 /// Screen state is structurally bounded by terminal dimensions, not by the
 /// user-facing scrollback log cap. The cap is a defense against damaged or
@@ -1123,17 +1130,17 @@ pub fn cleanupStaleSessions(alloc: Allocator, retention_seconds: i64) !void {
 /// Run stale session cleanup if another cleanup pass is not already active.
 /// Concurrent cleanup is idempotent but wasteful because each pass scans the
 /// full persisted session directory tree.
-pub fn cleanupStaleSessionsGuarded(alloc: Allocator) !bool {
+pub fn cleanupStaleSessionsGuarded(alloc: Allocator, retention_seconds: i64) !bool {
     if (stale_session_cleanup_running.swap(true, .acq_rel)) return false;
     defer stale_session_cleanup_running.store(false, .release);
 
-    try cleanupStaleSessions(alloc, stale_session_retention_seconds);
+    try cleanupStaleSessions(alloc, retention_seconds);
     return true;
 }
 
 /// Run stale session cleanup from the session-close hook, rate-limited so
 /// closing many tabs cannot force repeated full directory sweeps.
-pub fn cleanupStaleSessionsOnClose(alloc: Allocator) !bool {
+pub fn cleanupStaleSessionsOnClose(alloc: Allocator, retention_seconds: i64) !bool {
     const now = std.time.timestamp();
     while (true) {
         const last = stale_session_close_cleanup_last_timestamp.load(.monotonic);
@@ -1147,7 +1154,7 @@ pub fn cleanupStaleSessionsOnClose(alloc: Allocator) !bool {
         break;
     }
 
-    return try cleanupStaleSessionsGuarded(alloc);
+    return try cleanupStaleSessionsGuarded(alloc, retention_seconds);
 }
 
 fn writeScreenBytes(
@@ -1232,6 +1239,13 @@ test "cleanupStaleSessions deletes expired and keeps fresh" {
     try testing.expectError(error.FileNotFound, tmp.dir.access("ghostty/session/legacy-uuid/manifest", .{}));
 }
 
+test "retention seconds clamps configured days" {
+    const testing = std.testing;
+
+    try testing.expectEqual(@as(i64, 30 * 24 * 60 * 60), retentionSecondsFromDays(30));
+    try testing.expectEqual(@as(i64, 365 * 24 * 60 * 60), retentionSecondsFromDays(400));
+}
+
 test "cleanupStaleSessionsOnClose deletes expired sessions and rate limits repeated closes" {
     const testing = std.testing;
 
@@ -1269,7 +1283,7 @@ test "cleanupStaleSessionsOnClose deletes expired sessions and rate limits repea
         }
     }
 
-    try testing.expect(try cleanupStaleSessionsOnClose(testing.allocator));
+    try testing.expect(try cleanupStaleSessionsOnClose(testing.allocator, retentionSecondsFromDays(7)));
     try testing.expectError(error.FileNotFound, tmp.dir.access("ghostty/session/stale-uuid/screen", .{}));
 
     try tmp.dir.makePath("ghostty/session/stale-uuid-two");
@@ -1278,7 +1292,7 @@ test "cleanupStaleSessionsOnClose deletes expired sessions and rate limits repea
     defer stale_dir_two.close();
     _ = std.c.utimensat(stale_dir_two.fd, "screen", &times, 0);
 
-    try testing.expect(!try cleanupStaleSessionsOnClose(testing.allocator));
+    try testing.expect(!try cleanupStaleSessionsOnClose(testing.allocator, retentionSecondsFromDays(7)));
     try tmp.dir.access("ghostty/session/stale-uuid-two/screen", .{});
 }
 

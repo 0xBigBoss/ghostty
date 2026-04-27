@@ -241,7 +241,12 @@ pub const App = struct {
 
         const self = self_ orelse return .disarm;
         log.debug("stale session cleanup reason=hourly", .{});
-        _ = persisted_scrollback.cleanupStaleSessionsGuarded(global_state.alloc) catch |err| {
+        _ = persisted_scrollback.cleanupStaleSessionsGuarded(
+            global_state.alloc,
+            persisted_scrollback.retentionSecondsFromDays(
+                self.config.@"scrollback-persist-retention-days",
+            ),
+        ) catch |err| {
             log.warn("stale session cleanup failed reason=hourly err={}", .{err});
         };
 
@@ -1553,7 +1558,12 @@ pub const CAPI = struct {
 
         // Startup cleanup handles stale sessions left behind by prior Ghostty
         // runs before newly restored sessions begin refreshing their state.
-        _ = persisted_scrollback.cleanupStaleSessionsGuarded(global_state.alloc) catch |err| {
+        _ = persisted_scrollback.cleanupStaleSessionsGuarded(
+            global_state.alloc,
+            persisted_scrollback.retentionSecondsFromDays(
+                config.@"scrollback-persist-retention-days",
+            ),
+        ) catch |err| {
             log.warn("stale session cleanup failed reason=startup err={}", .{err});
         };
 

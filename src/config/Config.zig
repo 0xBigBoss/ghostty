@@ -2248,6 +2248,10 @@ keybind: Keybinds = .{},
 ///   * `0` disables persisted scrollback checkpoints entirely.
 ///   * Any positive value sets the byte cap of the scrollback log per surface.
 ///
+/// `scrollback-persist-mode = disabled` also disables persisted scrollback
+/// checkpoints. Use whichever option makes the intent clearer for your
+/// deployment.
+///
 /// The default is 10MB (`10485760`). Per-surface total disk usage is
 /// approximately this value plus a small constant for screen and metadata.
 ///
@@ -2255,6 +2259,75 @@ keybind: Keybinds = .{},
 ///
 /// This is currently only supported on macOS. This has no effect on Linux.
 @"scrollback-snapshot-limit": usize = 10 * 1024 * 1024,
+
+/// The maximum time, in milliseconds, between atomic replacements of the
+/// persisted active screen file while scrollback persistence is dirty.
+///
+/// Lower values reduce the amount of visible screen state that can be lost in
+/// a crash at the cost of more frequent small file replacements. Higher values
+/// reduce background IO but allow visible screen state to remain dirty longer.
+///
+/// The default is `5000`.
+///
+/// This is currently only supported on macOS. This has no effect on Linux.
+@"scrollback-persist-screen-interval-ms": u32 = 5_000,
+
+/// Controls append batching for the persisted scrollback log.
+///
+/// The value is a comma-separated `key:value` list:
+///
+///   * `rows` is the number of newly scrolled-out rows that can be batched
+///     before appending to the scrollback log.
+///   * `ms` is the maximum age, in milliseconds, before pending scrollback rows
+///     are appended even if the row count has not reached `rows`.
+///
+/// Screen files are still persisted according to
+/// `scrollback-persist-screen-interval-ms`; this only batches append-only
+/// scrollback log writes.
+///
+/// The default is `rows:16,ms:5000`.
+///
+/// This is currently only supported on macOS. This has no effect on Linux.
+@"scrollback-persist-row-batch": ScrollbackPersistRowBatch = .{},
+
+/// Controls whether persisted scrollback checkpoints are written.
+///
+/// Valid values are:
+///
+///   * `enabled` persists primary screen, alternate screen, and scrollback.
+///   * `active-only` persists primary screen and scrollback, but skips
+///     alternate screen contents.
+///   * `disabled` disables persisted scrollback checkpoints entirely.
+///
+/// The default is `enabled`.
+///
+/// This is currently only supported on macOS. This has no effect on Linux.
+@"scrollback-persist-mode": ScrollbackPersistMode = .enabled,
+
+/// Number of days to retain stale persisted scrollback session directories.
+///
+/// Values above the internal maximum are clamped to 365 days to prevent stale
+/// session data from growing without bound. A value of `0` keeps only sessions
+/// touched during the current cleanup interval.
+///
+/// The default is `7`.
+///
+/// This is currently only supported on macOS. This has no effect on Linux.
+@"scrollback-persist-retention-days": u32 = 7,
+
+/// Compression algorithm used for the persisted scrollback log.
+///
+/// Valid values are:
+///
+///   * `gzip` uses Ghostty's current built-in scrollback compression.
+///   * `zstd-3` is accepted as a schema-compatible spelling and currently maps
+///     to the same on-disk behavior as `gzip`.
+///   * `none` writes the scrollback log without compression.
+///
+/// The default is `gzip`.
+///
+/// This is currently only supported on macOS. This has no effect on Linux.
+@"scrollback-persist-compression": ScrollbackPersistCompression = .gzip,
 
 /// Resize the window in discrete increments of the focused surface's cell size.
 /// If this is disabled, surfaces are resized in pixel increments. Currently
@@ -9201,6 +9274,57 @@ pub const WindowSaveState = enum {
     always,
 };
 
+/// See scrollback-persist-row-batch
+pub const ScrollbackPersistRowBatch = struct {
+    const Self = @This();
+
+    rows: u32 = 16,
+    ms: u32 = 5_000,
+
+    pub fn parseCLI(self: *Self, alloc: Allocator, input: ?[]const u8) !void {
+        self.* = try cli.args.parseAutoStruct(
+            Self,
+            alloc,
+            input orelse return error.ValueRequired,
+            self.*,
+        );
+    }
+
+    pub fn clone(self: *const Self, _: Allocator) error{}!Self {
+        return self.*;
+    }
+
+    pub fn equal(self: Self, other: Self) bool {
+        return std.meta.eql(self, other);
+    }
+
+    pub fn formatEntry(self: Self, formatter: formatterpkg.EntryFormatter) !void {
+        var buf: [64]u8 = undefined;
+        try formatter.formatEntry(
+            []const u8,
+            std.fmt.bufPrint(
+                &buf,
+                "rows:{},ms:{}",
+                .{ self.rows, self.ms },
+            ) catch return error.OutOfMemory,
+        );
+    }
+};
+
+/// See scrollback-persist-mode
+pub const ScrollbackPersistMode = enum {
+    enabled,
+    @"active-only",
+    disabled,
+};
+
+/// See scrollback-persist-compression
+pub const ScrollbackPersistCompression = enum {
+    gzip,
+    @"zstd-3",
+    none,
+};
+
 /// See window-new-tab-position
 pub const WindowNewTabPosition = enum {
     current,
@@ -10927,5 +11051,42 @@ test "scrollback-snapshot-limit docs describe scrollback log cap" {
         u8,
         source,
         "Any positive value sets the byte cap of the scrollback log per surface.",
+    ) != null);
+}
+
+test "persisted scrollback config knobs parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        "--scrollback-persist-screen-interval-ms=9000",
+        "--scrollback-persist-row-batch=rows:32,ms:1500",
+        "--scrollback-persist-mode=active-only",
+        "--scrollback-persist-retention-days=30",
+        "--scrollback-persist-compression=none",
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(@as(u32, 9000), cfg.@"scrollback-persist-screen-interval-ms");
+    try testing.expectEqual(
+        ScrollbackPersistRowBatch{ .rows = 32, .ms = 1500 },
+        cfg.@"scrollback-persist-row-batch",
+    );
+    try testing.expectEqual(ScrollbackPersistMode.@"active-only", cfg.@"scrollback-persist-mode");
+    try testing.expectEqual(@as(u32, 30), cfg.@"scrollback-persist-retention-days");
+    try testing.expectEqual(ScrollbackPersistCompression.none, cfg.@"scrollback-persist-compression");
+}
+
+test "scrollback-snapshot-limit docs mention persist mode disabled" {
+    const testing = std.testing;
+    const source = @embedFile("Config.zig");
+
+    try testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "`scrollback-persist-mode = disabled` also disables persisted scrollback checkpoints.",
     ) != null);
 }
