@@ -34,8 +34,7 @@ pub const ScrollbackRecord = struct {
 
 /// Pre-serialized component data ready to be written to a session directory.
 pub const Capture = struct {
-    /// Written once for a session. Later publishes leave the immutable header
-    /// in place so the hot path only touches small mutable files.
+    /// Written whenever the capture header differs from the durable header.
     header: ?Header = null,
     metadata: ?Metadata = null,
     scrollback_append: []const ScrollbackRecord = &.{},
@@ -86,10 +85,7 @@ pub fn publish(
     defer dir.close();
 
     if (capture.header) |header| {
-        writeHeaderOnce(&dir, header) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try writeHeaderReplacing(&dir, header);
     }
 
     if (capture.metadata) |metadata| {
@@ -335,13 +331,7 @@ const ScreenBuilder = struct {
     }
 };
 
-fn writeHeaderOnce(dir: *std.fs.Dir, header: Header) !void {
-    var file = try dir.createFile("header", .{
-        .exclusive = true,
-        .mode = 0o600,
-    });
-    defer file.close();
-
+fn headerBytes(header: Header) [header_size]u8 {
     var data: [header_size]u8 = undefined;
     @memcpy(data[0..4], magic_header);
     std.mem.writeInt(u16, data[4..6], current_version, .little);
@@ -349,7 +339,29 @@ fn writeHeaderOnce(dir: *std.fs.Dir, header: Header) !void {
     std.mem.writeInt(i64, data[10..18], header.timestamp, .little);
     std.mem.writeInt(u16, data[18..20], header.cols, .little);
     std.mem.writeInt(u16, data[20..22], header.rows, .little);
-    try file.writeAll(&data);
+    return data;
+}
+
+fn writeHeaderReplacing(dir: *std.fs.Dir, header: Header) !void {
+    const data = headerBytes(header);
+
+    var file = dir.openFile("header", .{}) catch {
+        return try writeFileAtomic(dir, "header", &data);
+    };
+    defer file.close();
+
+    const stat = file.stat() catch {
+        return try writeFileAtomic(dir, "header", &data);
+    };
+    if (stat.size != header_size) return try writeFileAtomic(dir, "header", &data);
+
+    var existing: [header_size]u8 = undefined;
+    const read_len = file.readAll(&existing) catch {
+        return try writeFileAtomic(dir, "header", &data);
+    };
+    if (read_len == header_size and std.mem.eql(u8, &existing, &data)) return;
+
+    try writeFileAtomic(dir, "header", &data);
 }
 
 fn readHeader(data: []const u8) Error!Header {
@@ -849,8 +861,48 @@ test "persisted scrollback publish overwrites old file" {
     var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
     defer loaded.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(i64, 1), loaded.header.timestamp);
+    try testing.expectEqual(@as(i64, 2), loaded.header.timestamp);
     try testing.expectEqualStrings("new title", loaded.title.?);
+}
+
+test "publish replaces header when dimensions change" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    var first_term = try terminalpkg.Terminal.init(testing.allocator, .{ .cols = 20, .rows = 3 });
+    defer first_term.deinit(testing.allocator);
+    const first_screen = try writeScreenBytes(testing.allocator, &first_term.screens.active.*, 0, null);
+    defer testing.allocator.free(first_screen);
+
+    try publish(session_path, .{
+        .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
+        .screen = first_screen,
+        .screen_seq = 2,
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "session/header", .data = "bad header" });
+
+    var second_term = try terminalpkg.Terminal.init(testing.allocator, .{ .cols = 40, .rows = 5 });
+    defer second_term.deinit(testing.allocator);
+    const second_screen = try writeScreenBytes(testing.allocator, &second_term.screens.active.*, 0, null);
+    defer testing.allocator.free(second_screen);
+
+    try publish(session_path, .{
+        .header = .{ .timestamp = 2, .cols = 40, .rows = 5 },
+        .screen = second_screen,
+        .screen_seq = 4,
+    });
+
+    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u16, 40), loaded.header.cols);
+    try testing.expectEqual(@as(u16, 5), loaded.header.rows);
 }
 
 test "append-on-eviction over multiple ticks appends only new bytes" {

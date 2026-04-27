@@ -160,7 +160,10 @@ const PersistedState = struct {
     last_persisted_row_count: usize = 0,
     last_persisted_seq: u64 = 0,
     next_seq: u64 = 0,
+    scrollback_size_bytes: usize = 0,
+    scrollback_invalidated: bool = false,
     header_written: bool = false,
+    last_header_dims: ?PersistedHeaderDims = null,
     last_metadata_hash: u64 = 0,
     dirty: bool = false,
     dirty_generation: u64 = 0,
@@ -199,6 +202,12 @@ const PersistedState = struct {
             alloc.free(session_dir);
             return null;
         };
+        const scrollback_size_bytes = persistedScrollbackFileSize(session_dir) catch |err| size: {
+            if (err != error.FileNotFound) {
+                log.warn("persisted scrollback size unavailable dir={s} err={}", .{ session_dir, err });
+            }
+            break :size 0;
+        };
 
         log.debug(
             "persisted scrollback save enabled dir={s} limit={} session_id={s}",
@@ -212,7 +221,12 @@ const PersistedState = struct {
             .last_persisted_row_count = if (restored) |v| v.scrollback_rows else 0,
             .last_persisted_seq = if (restored) |v| v.scrollback_tail_seq else 0,
             .next_seq = if (restored) |v| v.next_seq else 0,
+            .scrollback_size_bytes = scrollback_size_bytes,
             .header_written = restored != null,
+            .last_header_dims = if (restored) |v| .{
+                .cols = v.header.cols,
+                .rows = v.header.rows,
+            } else null,
         };
     }
 
@@ -221,6 +235,11 @@ const PersistedState = struct {
         if (self.session_id) |value| alloc.free(value);
         self.* = undefined;
     }
+};
+
+const PersistedHeaderDims = struct {
+    cols: u16,
+    rows: u16,
 };
 
 pub const persisted_scrollback_debounce_ms = 400;
@@ -403,12 +422,7 @@ fn maybeLoadPersistedScrollback(
     };
     defer alloc.free(path);
 
-    // The per-surface byte budget is enforced during save, so the file
-    // size is inherently bounded. Use maxInt to avoid rejecting valid
-    // snapshots due to metadata size guesses — the allocator and OS
-    // provide the real memory bound.
-    const max_read = std.math.maxInt(usize);
-    const loaded = persisted_scrollback.load(alloc, path, max_read) catch |err| {
+    const loaded = persisted_scrollback.load(alloc, path, limit) catch |err| {
         log.warn("persisted scrollback restore skipped path={s} err={}", .{ path, err });
         return null;
     };
@@ -425,6 +439,17 @@ fn maybeLoadPersistedScrollback(
     );
 
     return loaded;
+}
+
+fn persistedScrollbackFileSize(session_dir: []const u8) !usize {
+    var dir = if (std.fs.path.isAbsolute(session_dir))
+        try std.fs.openDirAbsolute(session_dir, .{})
+    else
+        try std.fs.cwd().openDir(session_dir, .{});
+    defer dir.close();
+
+    const stat = try dir.statFile("scrollback");
+    return @intCast(stat.size);
 }
 
 fn restoredSessionLabel(alloc: Allocator, timestamp: i64) Allocator.Error![]u8 {
@@ -853,7 +878,10 @@ pub fn resize(
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
 
-        // Update the size of our terminal state
+        // A column change can reflow existing history rows in place. The
+        // persisted append log has to be rebuilt so restore doesn't combine
+        // stale pre-resize rows with the new layout.
+        const old_cols = self.terminal.cols;
         try self.terminal.resize(
             self.alloc,
             grid_size.columns,
@@ -873,6 +901,7 @@ pub fn resize(
             try self.sizeReportLocked(td, .mode_2048);
         }
 
+        if (old_cols != grid_size.columns) self.markPersistedScrollbackInvalidatedLocked();
         self.markPersistedScrollbackDirtyLocked();
     }
 
@@ -1097,6 +1126,11 @@ fn markPersistedScrollbackDirtyLocked(self: *Termio) void {
     self.queueMessage(.{ .persisted_scrollback_dirty = {} }, .locked);
 }
 
+fn markPersistedScrollbackInvalidatedLocked(self: *Termio) void {
+    const persisted = if (self.persisted) |*value| value else return;
+    persisted.scrollback_invalidated = true;
+}
+
 pub fn persistedScrollbackTimerDecision(self: *Termio) PersistedScheduleDecision {
     const now = std.time.Instant.now() catch return .flush;
 
@@ -1146,7 +1180,9 @@ const PersistedCapture = struct {
     next_row_count: usize,
     next_tail_seq: u64,
     next_seq: u64,
+    scrollback_size_bytes: usize,
     header_written: bool,
+    header_dims: ?PersistedHeaderDims = null,
     metadata_hash: u64,
     scrollback_records: []persisted_scrollback.ScrollbackRecord,
     metadata_session_id: ?[]u8 = null,
@@ -1193,6 +1229,58 @@ fn captureScreenData(
     return try buf.toOwnedSlice();
 }
 
+fn scrollbackRecordSize(record: persisted_scrollback.ScrollbackRecord) usize {
+    return 12 + record.bytes.len;
+}
+
+fn appendScrollbackRecord(
+    alloc: Allocator,
+    records: *std.ArrayListUnmanaged(persisted_scrollback.ScrollbackRecord),
+    primary: *const terminalpkg.Screen,
+    row_index: u32,
+    size_bytes: *usize,
+) !void {
+    const row_data = try captureScreenData(alloc, primary, row_index, 1);
+    records.append(alloc, .{ .bytes = row_data }) catch |err| {
+        alloc.free(row_data);
+        return err;
+    };
+    size_bytes.* += 12 + row_data.len;
+}
+
+fn clearScrollbackRecords(
+    alloc: Allocator,
+    records: *std.ArrayListUnmanaged(persisted_scrollback.ScrollbackRecord),
+) void {
+    for (records.items) |record| alloc.free(record.bytes);
+    records.clearRetainingCapacity();
+}
+
+fn trimScrollbackRecordsToLimit(
+    alloc: Allocator,
+    records: *std.ArrayListUnmanaged(persisted_scrollback.ScrollbackRecord),
+    limit: usize,
+    size_bytes: *usize,
+) u32 {
+    var drop_count: usize = 0;
+    while (size_bytes.* > limit and drop_count < records.items.len) : (drop_count += 1) {
+        const record = records.items[drop_count];
+        size_bytes.* -= scrollbackRecordSize(record);
+        alloc.free(record.bytes);
+    }
+
+    if (drop_count > 0) {
+        std.mem.copyForwards(
+            persisted_scrollback.ScrollbackRecord,
+            records.items[0 .. records.items.len - drop_count],
+            records.items[drop_count..],
+        );
+        records.shrinkRetainingCapacity(records.items.len - drop_count);
+    }
+
+    return @intCast(drop_count);
+}
+
 fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
@@ -1211,9 +1299,12 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
     const active_rows: u32 = @intCast(@min(total_rows, primary.pages.rows));
     const history_rows: u32 = total_rows - active_rows;
 
-    const rewrite_scrollback = history_rows < persisted.last_persisted_row_count;
-    const append_start: u32 = if (rewrite_scrollback) 0 else @intCast(persisted.last_persisted_row_count);
-    const append_count: u32 = history_rows - append_start;
+    var rewrite_scrollback =
+        persisted.scrollback_invalidated or
+        history_rows < persisted.last_persisted_row_count or
+        persisted.scrollback_size_bytes > persisted.limit;
+    var append_start: u32 = if (rewrite_scrollback) 0 else @intCast(persisted.last_persisted_row_count);
+    var scrollback_size_bytes: usize = if (rewrite_scrollback) 0 else persisted.scrollback_size_bytes;
 
     var records_list: std.ArrayListUnmanaged(persisted_scrollback.ScrollbackRecord) = .empty;
     errdefer {
@@ -1223,20 +1314,45 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
 
     var row_index = append_start;
     while (row_index < history_rows) : (row_index += 1) {
-        const row_data = try captureScreenData(self.alloc, primary, row_index, 1);
-        records_list.append(self.alloc, .{ .bytes = row_data }) catch |err| {
-            self.alloc.free(row_data);
-            return err;
-        };
+        try appendScrollbackRecord(self.alloc, &records_list, primary, row_index, &scrollback_size_bytes);
     }
 
+    if (!rewrite_scrollback and scrollback_size_bytes > persisted.limit) {
+        clearScrollbackRecords(self.alloc, &records_list);
+        rewrite_scrollback = true;
+        append_start = 0;
+        scrollback_size_bytes = 0;
+
+        row_index = 0;
+        while (row_index < history_rows) : (row_index += 1) {
+            try appendScrollbackRecord(self.alloc, &records_list, primary, row_index, &scrollback_size_bytes);
+        }
+    }
+
+    const dropped_rows = trimScrollbackRecordsToLimit(
+        self.alloc,
+        &records_list,
+        persisted.limit,
+        &scrollback_size_bytes,
+    );
+    if (dropped_rows > 0) rewrite_scrollback = true;
+
     var seq_cursor = persisted.next_seq;
-    const scrollback_first_seq = seq_cursor;
-    const next_tail_seq = if (append_count > 0)
-        scrollback_first_seq +% append_count -% 1
+    const history_seq_count: u32 = if (rewrite_scrollback)
+        history_rows
+    else
+        @intCast(records_list.items.len);
+    const scrollback_first_seq = if (rewrite_scrollback)
+        seq_cursor +% dropped_rows
+    else
+        seq_cursor;
+    const next_tail_seq = if (records_list.items.len > 0)
+        scrollback_first_seq +% @as(u64, @intCast(records_list.items.len)) -% 1
+    else if (rewrite_scrollback)
+        0
     else
         persisted.last_persisted_seq;
-    seq_cursor +%= append_count;
+    seq_cursor +%= history_seq_count;
 
     const screen_start = history_rows;
     const screen_data = try captureScreenData(self.alloc, primary, screen_start, active_rows);
@@ -1258,6 +1374,15 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
         self.terminal.getTitle(),
     );
     const metadata_changed = metadata_hash != persisted.last_metadata_hash;
+    const header_dims: PersistedHeaderDims = .{
+        .cols = @intCast(primary.pages.cols),
+        .rows = @intCast(primary.pages.rows),
+    };
+    const header_changed = if (persisted.last_header_dims) |last|
+        last.cols != header_dims.cols or last.rows != header_dims.rows
+    else
+        true;
+    const include_header = !persisted.header_written or header_changed;
 
     const metadata_session_id = if (!persisted.header_written or metadata_changed)
         try persisted_scrollback.dupeOptional(self.alloc, persisted.session_id)
@@ -1281,11 +1406,11 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
     return .{
         .generation = persisted.dirty_generation,
         .capture = .{
-            .header = if (persisted.header_written) null else .{
+            .header = if (include_header) .{
                 .timestamp = std.time.timestamp(),
-                .cols = @intCast(primary.pages.cols),
-                .rows = @intCast(primary.pages.rows),
-            },
+                .cols = header_dims.cols,
+                .rows = header_dims.rows,
+            } else null,
             .metadata = if (!persisted.header_written or metadata_changed) .{
                 .session_id = metadata_session_id,
                 .pwd = metadata_pwd,
@@ -1302,7 +1427,9 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
         .next_row_count = history_rows,
         .next_tail_seq = next_tail_seq,
         .next_seq = seq_cursor,
+        .scrollback_size_bytes = scrollback_size_bytes,
         .header_written = true,
+        .header_dims = if (include_header) header_dims else null,
         .metadata_hash = metadata_hash,
         .scrollback_records = records,
         .metadata_session_id = metadata_session_id,
@@ -1339,7 +1466,10 @@ pub fn flushPersistedScrollback(self: *Termio) !void {
         value.last_persisted_row_count = capture.next_row_count;
         value.last_persisted_seq = capture.next_tail_seq;
         value.next_seq = capture.next_seq;
+        value.scrollback_size_bytes = capture.scrollback_size_bytes;
+        value.scrollback_invalidated = false;
         value.header_written = capture.header_written;
+        if (capture.header_dims) |dims| value.last_header_dims = dims;
         value.last_metadata_hash = capture.metadata_hash;
         if (value.dirty_generation == capture.generation) {
             value.dirty = false;
@@ -1503,6 +1633,203 @@ test "maybeLoadPersistedScrollback leaves malformed session files in place" {
     // Directory should still exist after the failed load.
     var dir = try std.fs.openDirAbsolute(victim_path, .{});
     dir.close();
+}
+
+fn persistedTestTermio(
+    alloc: Allocator,
+    session_dir: []u8,
+    terminal: terminalpkg.Terminal,
+    renderer_state: *renderer.State,
+    limit: usize,
+) Termio {
+    return .{
+        .alloc = alloc,
+        .terminal = terminal,
+        .renderer_state = renderer_state,
+        .backend = undefined,
+        .config = undefined,
+        .renderer_wakeup = undefined,
+        .renderer_mailbox = undefined,
+        .surface_mailbox = undefined,
+        .size = undefined,
+        .mailbox = undefined,
+        .terminal_stream = undefined,
+        .persisted = .{
+            .session_dir = session_dir,
+            .session_id = null,
+            .limit = limit,
+            .dirty = true,
+            .dirty_generation = 1,
+            .notify_pending = true,
+        },
+    };
+}
+
+fn markPersistedDirtyForTest(io: *Termio) void {
+    if (io.persisted) |*persisted| {
+        persisted.dirty = true;
+        persisted.dirty_generation +%= 1;
+    }
+}
+
+fn capturePrimarySnapshotForTest(
+    alloc: Allocator,
+    terminal: *const terminalpkg.Terminal,
+) !terminalpkg.snapshot.ScreenData {
+    const primary = terminal.screens.get(.primary) orelse terminal.screens.active;
+    const total_rows = terminalpkg.snapshot.screenRowCount(primary);
+    const bytes = try captureScreenData(alloc, primary, 0, total_rows);
+    defer alloc.free(bytes);
+    return try terminalpkg.snapshot.readScreenData(alloc, bytes);
+}
+
+fn expectScreenDataEqual(
+    expected: *const terminalpkg.snapshot.ScreenData,
+    actual: *const terminalpkg.snapshot.ScreenData,
+) !void {
+    const testing = std.testing;
+
+    try testing.expectEqual(expected.cols, actual.cols);
+    try testing.expectEqual(expected.rows.len, actual.rows.len);
+    for (expected.rows, actual.rows) |expected_row, actual_row| {
+        try testing.expectEqual(expected_row.wrap, actual_row.wrap);
+        try testing.expectEqual(expected_row.wrap_continuation, actual_row.wrap_continuation);
+        try testing.expectEqual(expected_row.semantic_prompt, actual_row.semantic_prompt);
+        try testing.expectEqualSlices(u64, expected_row.cells, actual_row.cells);
+    }
+}
+
+fn screenDataContainsAscii(
+    data: *const terminalpkg.snapshot.ScreenData,
+    needle: []const u8,
+) bool {
+    if (needle.len == 0) return true;
+
+    var matched: usize = 0;
+    for (data.rows) |row| {
+        for (row.cells) |raw| {
+            const cell: terminalpkg.Cell = @bitCast(raw);
+            if (cell.content_tag != .codepoint) {
+                matched = 0;
+                continue;
+            }
+
+            const cp = cell.content.codepoint;
+            if (cp > std.math.maxInt(u8)) {
+                matched = 0;
+                continue;
+            }
+
+            if (@as(u8, @intCast(cp)) == needle[matched]) {
+                matched += 1;
+                if (matched == needle.len) return true;
+            } else {
+                matched = 0;
+            }
+        }
+        matched = 0;
+    }
+
+    return false;
+}
+
+test "persisted scrollback capture enforces byte limit with recent tail rows" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("session");
+
+    const session_path = try tmp_dir.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+    const session_dir = try testing.allocator.dupe(u8, session_path);
+
+    var terminal = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 8,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+
+    var mutex = std.Thread.Mutex{};
+    var state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &terminal,
+    };
+    var io = persistedTestTermio(testing.allocator, session_dir, terminal, &state, 1024);
+    state.terminal = &io.terminal;
+    defer {
+        if (io.persisted) |*persisted| persisted.deinit(testing.allocator);
+        io.terminal.deinit(testing.allocator);
+    }
+
+    var input: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer input.deinit();
+    for (0..40) |i| try input.writer.print("row-{d:0>2}\n", .{i});
+    try io.terminal.printString(input.writer.buffer[0..input.writer.end]);
+
+    const total_rows = terminalpkg.snapshot.screenRowCount(&io.terminal.screens.active.*);
+    const history_rows = total_rows - @min(total_rows, io.terminal.screens.active.pages.rows);
+
+    try io.flushPersistedScrollback();
+
+    var dir = try std.fs.openDirAbsolute(session_path, .{});
+    defer dir.close();
+    const scrollback_stat = try dir.statFile("scrollback");
+    try testing.expect(scrollback_stat.size <= 1024);
+
+    var loaded = try persisted_scrollback.load(testing.allocator, session_path, 1024);
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expect(loaded.scrollback_rows < history_rows);
+    try testing.expect(screenDataContainsAscii(&loaded.primary, "row-39"));
+    try testing.expect(!screenDataContainsAscii(&loaded.primary, "row-00"));
+}
+
+test "persisted scrollback capture rewrites after resize reflow" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("session");
+
+    const session_path = try tmp_dir.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+    const session_dir = try testing.allocator.dupe(u8, session_path);
+
+    var terminal = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+
+    var mutex = std.Thread.Mutex{};
+    var state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &terminal,
+    };
+    var io = persistedTestTermio(testing.allocator, session_dir, terminal, &state, 64 * 1024);
+    state.terminal = &io.terminal;
+    defer {
+        if (io.persisted) |*persisted| persisted.deinit(testing.allocator);
+        io.terminal.deinit(testing.allocator);
+    }
+
+    try io.terminal.printString("abcdefghijABCDEFGHIJ\nklmnopqrstKLMNOPQRST\nuvwxyzabcdUVWXYZABCD\n");
+    try io.flushPersistedScrollback();
+
+    try io.terminal.resize(testing.allocator, 5, 3);
+    io.markPersistedScrollbackInvalidatedLocked();
+    markPersistedDirtyForTest(&io);
+
+    var expected = try capturePrimarySnapshotForTest(testing.allocator, &io.terminal);
+    defer expected.deinit(testing.allocator);
+
+    try io.flushPersistedScrollback();
+
+    var loaded = try persisted_scrollback.load(testing.allocator, session_path, 64 * 1024);
+    defer loaded.deinit(testing.allocator);
+
+    try expectScreenDataEqual(&expected, &loaded.primary);
 }
 
 test "persisted scrollback schedule waits for trailing debounce" {
