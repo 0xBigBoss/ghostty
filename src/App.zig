@@ -15,6 +15,7 @@ const Config = configpkg.Config;
 const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
 const renderer = @import("renderer.zig");
 const font = @import("font/main.zig");
+const global = @import("global.zig");
 
 const log = std.log.scoped(.app);
 
@@ -127,6 +128,12 @@ pub fn destroy(self: *App) void {
 /// events. This should be called by the application runtime on every loop
 /// tick.
 pub fn tick(self: *App, rt_app: *apprt.App) !void {
+    if (global.consumeGracefulShutdownRequest()) {
+        log.info("graceful shutdown requested by signal", .{});
+        try self.performAction(rt_app, .quit);
+        return;
+    }
+
     // Drain our mailbox
     try self.drainMailbox(rt_app);
 }

@@ -3312,6 +3312,8 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     if (self.focused == focused) return;
     self.focused = focused;
 
+    if (!focused) _ = self.io.schedulePersistedScrollbackLifecycleFlush();
+
     // Notify our render thread of the new state
     _ = self.renderer_thread.mailbox.push(.{
         .focus = focused,

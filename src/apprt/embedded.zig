@@ -1568,6 +1568,14 @@ pub const CAPI = struct {
         };
     }
 
+    export fn ghostty_app_persist_all(v: *App) void {
+        for (v.core_app.surfaces.items) |surface| {
+            surface.core().io.flushPersistedScrollback() catch |err| {
+                log.warn("error flushing persisted scrollback during app persist all err={}", .{err});
+            };
+        }
+    }
+
     /// Return the userdata associated with the app.
     export fn ghostty_app_userdata(v: *App) ?*anyopaque {
         return v.opts.userdata;
@@ -2385,5 +2393,6 @@ test "ghostty.h surface config has surface_uuid for session identity" {
     // The core derives the manifest path from surface_uuid using XDG
     // state conventions. No separate manifest path field is needed.
     try testing.expect(@hasField(c.ghostty_surface_config_s, "surface_uuid"));
+    try testing.expect(@hasDecl(c, "ghostty_app_persist_all"));
     try testing.expect(!@hasDecl(c, "ghostty_surface_export_snapshot"));
 }

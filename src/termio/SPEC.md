@@ -33,6 +33,10 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - REQ-SNAPSHOT-011: Stale persisted session cleanup must run hourly while the embedded app process remains alive.
 - REQ-SNAPSHOT-012: Stale persisted session cleanup must run from session close, rate-limited so closing many tabs cannot trigger repeated full directory sweeps.
 - REQ-SNAPSHOT-013: Stale persisted session cleanup must keep the hardcoded seven-day retention policy until a separate configuration phase changes it.
+- REQ-SNAPSHOT-014: Surface close must flush dirty persisted scrollback before `Termio` releases persisted state.
+- REQ-SNAPSHOT-015: Surface focus loss must schedule an already-dirty persisted scrollback state for the next immediate background flush without performing disk IO in the focus callback.
+- REQ-SNAPSHOT-016: SIGTERM and SIGINT must request graceful app shutdown through an async-signal-safe flag that the app loop consumes.
+- REQ-SNAPSHOT-017: The embedded C API must expose an app-wide persisted scrollback flush entry point for native lifecycle delegates to call before process teardown.
 
 ## Invariants
 
@@ -41,6 +45,7 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - Background persistence policy must not require user-configurable knobs to preserve correctness.
 - A failed persisted scrollback write must not silently leave the surface permanently stale.
 - Stale session cleanup must not run on the renderer thread.
+- Signal handlers must not call non-async-signal-safe persistence or app teardown code directly.
 
 ## Non-goals
 
@@ -49,6 +54,7 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - Guaranteeing that every shell shutdown transcript is captured in full.
 - Turning termination flushing into a best-effort free path that depends on ARC timing alone.
 - Making stale session retention configurable.
+- Wiring macOS Swift `applicationWillTerminate`.
 
 ## Acceptance Criteria
 
@@ -59,7 +65,13 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - [ ] Diagnostic logs distinguish normal background flushes from termination flushes and retries.
 - [ ] A Ghostty process running for more than an hour performs stale session cleanup without requiring restart.
 - [ ] Closing a surface can delete a stale persisted session directory, but repeated closes within five minutes do not force repeated sweeps.
+- [ ] Losing focus with dirty persisted scrollback schedules an immediate flush decision.
+- [ ] SIGTERM or SIGINT exits through the normal app quit path instead of flushing from the signal handler.
+- [ ] Native embedders can call `ghostty_app_persist_all` before application termination.
 
 ## Test Traceability
 
 - REQ-SNAPSHOT-012: `src/termio/persisted_scrollback.zig` test `cleanupStaleSessionsOnClose deletes expired sessions and rate limits repeated closes`
+- REQ-SNAPSHOT-015: `src/termio/Termio.zig` test `persisted scrollback lifecycle request flushes dirty state immediately`
+- REQ-SNAPSHOT-016: `src/global.zig` test `graceful shutdown request flag is one-shot`
+- REQ-SNAPSHOT-017: `src/apprt/embedded.zig` test `ghostty.h surface config has surface_uuid for session identity`

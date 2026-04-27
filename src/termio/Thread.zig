@@ -344,7 +344,7 @@ fn drainMailbox(
                 try io.changeConfig(data, config.ptr);
             },
             .inspector => |v| self.flags.has_inspector = v,
-            .persisted_scrollback_dirty => self.startPersistedScrollbackTimer(cb),
+            .persisted_scrollback_dirty => |v| self.startPersistedScrollbackTimer(cb, v.immediate),
             .prepare_termination => |v| self.prepareTermination(cb, v),
             .resize => |v| self.handleResize(cb, v),
             .size_report => |v| try io.sizeReport(data, v),
@@ -401,8 +401,11 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
     );
 }
 
-fn startPersistedScrollbackTimer(self: *Thread, cb: *CallbackData) void {
-    self.startPersistedScrollbackTimerDelay(cb, termio.Termio.persisted_scrollback_debounce_ms);
+fn startPersistedScrollbackTimer(self: *Thread, cb: *CallbackData, immediate: bool) void {
+    self.startPersistedScrollbackTimerDelay(
+        cb,
+        if (immediate) 1 else termio.Termio.persisted_scrollback_debounce_ms,
+    );
 }
 
 fn startPersistedScrollbackTimerDelay(self: *Thread, cb: *CallbackData, delay_ms: u64) void {

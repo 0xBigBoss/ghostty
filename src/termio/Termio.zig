@@ -5,6 +5,7 @@
 pub const Termio = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -331,6 +332,35 @@ fn persistedScrollbackRetryDelayMs(retry_count: u8) u64 {
     const shift = @min(retry_count, 3);
     const delay = @as(u64, persisted_scrollback_retry_base_ms) << @intCast(shift);
     return @min(delay, persisted_scrollback_retry_cap_ms);
+}
+
+fn instantSubtractNs(instant: std.time.Instant, ns: u64) std.time.Instant {
+    var result = instant;
+    switch (comptime builtin.os.tag) {
+        .windows => return result,
+        .uefi, .wasi => result.timestamp -|= ns,
+        else => {
+            const sec_delta: @TypeOf(result.timestamp.sec) = @intCast(ns / std.time.ns_per_s);
+            const nsec_delta: @TypeOf(result.timestamp.nsec) = @intCast(ns % std.time.ns_per_s);
+            if (result.timestamp.nsec < nsec_delta) {
+                result.timestamp.sec -= 1;
+                result.timestamp.nsec += @intCast(std.time.ns_per_s);
+            }
+            result.timestamp.sec -= sec_delta;
+            result.timestamp.nsec -= nsec_delta;
+        },
+    }
+    return result;
+}
+
+fn requestPersistedScrollbackLifecycleFlushLocked(
+    persisted: *PersistedState,
+    now: std.time.Instant,
+) void {
+    persisted.dirty_started_at = instantSubtractNs(
+        now,
+        persisted_scrollback_max_staleness_ms * std.time.ns_per_ms,
+    );
 }
 
 /// The configuration for this IO that is derived from the main
@@ -1135,7 +1165,26 @@ fn markPersistedScrollbackDirtyLocked(self: *Termio) void {
     if (persisted.notify_pending) return;
 
     persisted.notify_pending = true;
-    self.queueMessage(.{ .persisted_scrollback_dirty = {} }, .locked);
+    self.queueMessage(.{ .persisted_scrollback_dirty = .{} }, .locked);
+}
+
+pub fn schedulePersistedScrollbackLifecycleFlush(self: *Termio) bool {
+    const now = std.time.Instant.now() catch return false;
+
+    self.renderer_state.mutex.lock();
+    const should_schedule = should_schedule: {
+        const persisted = if (self.persisted) |*value| value else break :should_schedule false;
+        if (!persisted.dirty) break :should_schedule false;
+
+        requestPersistedScrollbackLifecycleFlushLocked(persisted, now);
+        persisted.notify_pending = true;
+        break :should_schedule true;
+    };
+    self.renderer_state.mutex.unlock();
+
+    if (!should_schedule) return false;
+    self.queueMessage(.{ .persisted_scrollback_dirty = .{ .immediate = true } }, .unlocked);
+    return true;
 }
 
 fn markPersistedScrollbackInvalidatedLocked(self: *Termio) void {
@@ -2168,6 +2217,31 @@ test "persisted scrollback schedule flushes after quiet debounce" {
             .dirty = true,
             .dirty_age_ms = 500,
             .idle_ms = 400,
+        }),
+    );
+}
+
+test "persisted scrollback lifecycle request flushes dirty state immediately" {
+    const testing = std.testing;
+
+    const now = try std.time.Instant.now();
+    var persisted: PersistedState = .{
+        .session_dir = undefined,
+        .session_id = null,
+        .limit = 1024,
+        .dirty = true,
+        .dirty_started_at = now,
+        .last_dirty_at = now,
+    };
+
+    requestPersistedScrollbackLifecycleFlushLocked(&persisted, now);
+
+    try testing.expectEqual(
+        PersistedScheduleDecision.flush,
+        persistedScrollbackScheduleDecision(.{
+            .dirty = persisted.dirty,
+            .dirty_age_ms = @intCast(now.since(persisted.dirty_started_at.?) / std.time.ns_per_ms),
+            .idle_ms = @intCast(now.since(persisted.last_dirty_at.?) / std.time.ns_per_ms),
         }),
     );
 }
