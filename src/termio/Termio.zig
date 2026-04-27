@@ -1890,6 +1890,49 @@ test "persisted scrollback load accepts normal screen with small scrollback limi
     try testing.expect(screenDataContainsAscii(&loaded.primary, "row-39"));
 }
 
+test "persisted scrollback load accepts captured screen larger than legacy read cap" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("session");
+
+    const session_path = try tmp_dir.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+    const session_dir = try testing.allocator.dupe(u8, session_path);
+
+    const cols = 4096;
+    const rows = 129;
+    var terminal = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = cols,
+        .rows = rows,
+    });
+
+    var mutex = std.Thread.Mutex{};
+    var state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &terminal,
+    };
+    var io = persistedTestTermio(testing.allocator, session_dir, terminal, &state, 1024);
+    state.terminal = &io.terminal;
+    defer {
+        if (io.persisted) |*persisted| persisted.deinit(testing.allocator);
+        io.terminal.deinit(testing.allocator);
+    }
+
+    try io.flushPersistedScrollback();
+
+    var dir = try std.fs.openDirAbsolute(session_path, .{});
+    defer dir.close();
+    const screen_stat = try dir.statFile("screen");
+    try testing.expect(screen_stat.size > 4 * 1024 * 1024);
+
+    var loaded = try persisted_scrollback.load(testing.allocator, session_path, .{ .scrollback = 1024 });
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, rows), loaded.primary.rows.len);
+}
+
 test "persisted scrollback capture rewrites after resize reflow" {
     const testing = std.testing;
 

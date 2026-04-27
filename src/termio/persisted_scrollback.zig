@@ -17,9 +17,10 @@ const screen_prefix_size: usize = 14;
 const scrollback_record_prefix_size: usize = 12;
 
 /// Screen state is structurally bounded by terminal dimensions, not by the
-/// user-facing scrollback log cap. Four MiB covers large visible screens while
-/// still preventing unbounded reads from damaged or hostile session dirs.
-pub const screen_file_max_size: usize = 4 * 1024 * 1024;
+/// user-facing scrollback log cap. The cap is a defense against damaged or
+/// hostile session dirs, so it must comfortably exceed any plausible visible
+/// grid that capture can write while still rejecting absurd files.
+pub const screen_file_max_size: usize = 64 * 1024 * 1024;
 
 pub const Limits = struct {
     /// `scrollback-snapshot-limit` caps the on-disk scrollback log file only.

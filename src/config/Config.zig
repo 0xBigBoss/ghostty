@@ -2232,18 +2232,24 @@ keybind: Keybinds = .{},
 /// This is currently only supported on macOS. This has no effect on Linux.
 @"window-save-state": WindowSaveState = .default,
 
-/// The maximum scrollback checkpoint size in bytes that Ghostty will
-/// persist per surface. When a stable session identifier is available,
-/// Ghostty periodically saves a binary snapshot of the terminal
-/// scrollback to disk and restores it on next launch. This is
-/// independent of `window-save-state`.
+/// The maximum size in bytes of the on-disk persisted scrollback log per
+/// surface. When a stable session identifier is available, Ghostty
+/// periodically saves a binary snapshot of the terminal scrollback to
+/// disk and restores it on next launch. This is independent of
+/// `window-save-state`.
+///
+/// This cap applies to the per-surface scrollback log file specifically.
+/// The active screen, alternate screen, header, and metadata for a session
+/// are persisted separately and bounded by their own internal caps
+/// proportional to grid size; they are unaffected by this knob.
 ///
 /// Valid values are:
 ///
 ///   * `0` disables persisted scrollback checkpoints entirely.
-///   * Any positive value sets the byte cap per surface.
+///   * Any positive value sets the byte cap of the scrollback log per surface.
 ///
-/// The default is 10MB (`10485760`).
+/// The default is 10MB (`10485760`). Per-surface total disk usage is
+/// approximately this value plus a small constant for screen and metadata.
 ///
 /// This can be changed at runtime but will only affect newly saved state.
 ///
@@ -10906,4 +10912,20 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "scrollback-snapshot-limit docs describe scrollback log cap" {
+    const testing = std.testing;
+    const source = @embedFile("Config.zig");
+
+    try testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "This cap applies to the per-surface scrollback log file specifically.",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "Any positive value sets the byte cap of the scrollback log per surface.",
+    ) != null);
 }
