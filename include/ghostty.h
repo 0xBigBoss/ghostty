@@ -472,6 +472,7 @@ typedef struct {
   float font_size;
   const char* working_directory;
   const char* command;
+  const char* surface_uuid;
   ghostty_env_var_s* env_vars;
   size_t env_var_count;
   const char* initial_input;
@@ -1086,6 +1087,15 @@ GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
 GHOSTTY_API void ghostty_app_free(ghostty_app_t);
 GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
+/// Flush all dirty persisted-scrollback pages across every surface.
+/// Bounded by `timeout_ms` total. Holds the App's surfaces lock for the
+/// duration; do NOT call concurrently with code paths that close or destroy
+/// surfaces if you need them to remain unblocked. Designed for termination
+/// handlers.
+///
+/// macOS apprts should call this from application termination handlers with
+/// timeout_ms <= 1500 so the Zig core enforces the shutdown bound.
+GHOSTTY_API void ghostty_app_persist_all(ghostty_app_t, uint32_t timeout_ms);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
@@ -1101,6 +1111,9 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_prepare_for_quit(ghostty_surface_t,
+                                                  uint32_t,
+                                                  uint32_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);

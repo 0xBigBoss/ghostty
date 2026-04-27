@@ -59,6 +59,10 @@ pub fn deinit(self: *Exec) void {
     self.subprocess.deinit();
 }
 
+pub fn beginGracefulShutdown(self: *Exec) void {
+    self.subprocess.requestStop();
+}
+
 /// Call to initialize the terminal state as necessary for this backend.
 /// This is called before any termio begins. This should not be called
 /// after termio begins because it may put the internal terminal state
@@ -811,10 +815,12 @@ const Subprocess = struct {
         // Add the environment variables that override any others.
         {
             var it = cfg.env_override.iterator();
-            while (it.next()) |entry| try env.put(
-                entry.key_ptr.*,
-                entry.value_ptr.*,
-            );
+            while (it.next()) |entry| {
+                try env.put(
+                    entry.key_ptr.*,
+                    entry.value_ptr.*,
+                );
+            }
         }
 
         // Build our args list
@@ -1086,9 +1092,21 @@ const Subprocess = struct {
         self.process = null;
     }
 
-    /// Stop the subprocess. This is safe to call anytime. This will wait
-    /// for the subprocess to register that it has been signalled, but not
-    /// for it to terminate, so it will not block.
+    /// Request subprocess shutdown without waiting for process exit.
+    /// This does not close the pty.
+    pub fn requestStop(self: *Subprocess) void {
+        switch (self.process orelse return) {
+            .fork_exec => |*cmd| requestCommandStop(cmd) catch |err|
+                log.err("error sending SIGHUP to command err={}", .{err}),
+
+            .flatpak => |*cmd| if (comptime build_config.flatpak) {
+                requestCommandStopFlatpak(cmd) catch |err|
+                    log.err("error sending SIGHUP to command err={}", .{err});
+            },
+        }
+    }
+
+    /// Stop the subprocess and wait for process exit when supported.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
         switch (self.process orelse return) {
@@ -1136,23 +1154,31 @@ const Subprocess = struct {
     /// Kill the underlying subprocess. This sends a SIGHUP to the child
     /// process. This also waits for the command to exit and will return the
     /// exit code.
-    fn killCommand(command: *Command) !void {
+    fn requestCommandStop(command: *Command) !void {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
                     if (windows.kernel32.TerminateProcess(pid, 0) == 0) {
                         return windows.unexpectedError(windows.kernel32.GetLastError());
                     }
-
-                    _ = try command.wait(false);
                 },
 
-                else => try killPid(pid),
+                else => try signalPid(pid),
             }
         }
     }
 
-    fn killPid(pid: c.pid_t) !void {
+    fn killCommand(command: *Command) !void {
+        try requestCommandStop(command);
+        if (builtin.os.tag == .windows) {
+            _ = try command.wait(false);
+            return;
+        }
+
+        if (command.pid) |pid| try waitForPidExit(pid);
+    }
+
+    fn signalPid(pid: c.pid_t) !void {
         const pgid = getpgid(pid) orelse return;
 
         // It is possible to send a killpg between the time that
@@ -1162,29 +1188,31 @@ const Subprocess = struct {
         // and repeatedly kill the process group until all
         // descendents are well and truly dead. We will not rest
         // until the entire family tree is obliterated.
+        switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
+            .SUCCESS => log.debug("process group signaled pgid={}", .{pgid}),
+            else => |err| killpg: {
+                if ((comptime builtin.target.os.tag.isDarwin()) and
+                    err == .PERM)
+                {
+                    log.debug("killpg failed with EPERM, expected on Darwin and ignoring", .{});
+                    break :killpg;
+                }
+
+                log.warn("error killing process group pgid={} err={}", .{ pgid, err });
+                return error.KillFailed;
+            },
+        }
+    }
+
+    fn waitForPidExit(pid: c.pid_t) !void {
         while (true) {
-            switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
-                .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
-                else => |err| killpg: {
-                    if ((comptime builtin.target.os.tag.isDarwin()) and
-                        err == .PERM)
-                    {
-                        log.debug("killpg failed with EPERM, expected on Darwin and ignoring", .{});
-                        break :killpg;
-                    }
-
-                    log.warn("error killing process group pgid={} err={}", .{ pgid, err });
-                    return error.KillFailed;
-                },
-            }
-
-            // See Command.zig wait for why we specify WNOHANG.
-            // The gist is that it lets us detect when children
-            // are still alive without blocking so that we can
-            // kill them again.
             const res = posix.waitpid(pid, std.c.W.NOHANG);
             log.debug("waitpid result={}", .{res.pid});
             if (res.pid != 0) break;
+            signalPid(pid) catch |err| {
+                log.warn("error re-signaling process group pid={} err={}", .{ pid, err });
+                return err;
+            };
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }
@@ -1227,8 +1255,12 @@ const Subprocess = struct {
 
     /// Kill the underlying process started via Flatpak host command.
     /// This sends a signal via the Flatpak API.
-    fn killCommandFlatpak(command: *FlatpakHostCommand) !void {
+    fn requestCommandStopFlatpak(command: *FlatpakHostCommand) !void {
         try command.signal(c.SIGHUP, true);
+    }
+
+    fn killCommandFlatpak(command: *FlatpakHostCommand) !void {
+        try requestCommandStopFlatpak(command);
     }
 
     /// Get information about the process(es) running within the subprocess.

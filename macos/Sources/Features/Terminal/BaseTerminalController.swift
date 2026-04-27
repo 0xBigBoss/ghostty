@@ -290,7 +290,7 @@ class BaseTerminalController: NSWindowController,
     func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
-            focusedSurface = nil
+            focusedSurfaceDidChange(to: nil)
         }
     }
 
@@ -745,7 +745,7 @@ class BaseTerminalController: NSWindowController,
         // keep track of our old one so undo sends focus back to the right place.
         let oldFocusedSurface = focusedSurface
         if focusedSurface == target {
-            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)
+            focusedSurfaceDidChange(to: findNextFocusTargetAfterClosing(node: targetNode))
         }
 
         // Remove the surface from our tree

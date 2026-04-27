@@ -105,6 +105,10 @@ final class TerminalRestorableState: TerminalRestorable {
     func encode(to encoder: any Encoder) throws {
         try internalState.encode(to: encoder)
     }
+
+    var surfaceIDs: [String] {
+        surfaceTree.map(\.id.uuidString)
+    }
 }
 
 enum TerminalRestoreError: Error {
@@ -124,6 +128,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
     ) {
         // Verify the identifier is what we expect
         guard identifier == .init(String(describing: Self.self)) else {
+            AppDelegate.logger.warning("window restore skipped identifier=\(identifier.rawValue, privacy: .public) reason=identifier-unknown")
             completionHandler(nil, TerminalRestoreError.identifierUnknown)
             return
         }
@@ -147,9 +152,15 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         // Decode the state. If we can't decode the state, then we can't restore.
         guard let state = TerminalRestorableState(coder: state) else {
+            AppDelegate.logger.warning("window restore skipped reason=state-decode-failed")
             completionHandler(nil, TerminalRestoreError.stateDecodeFailed)
             return
         }
+
+        let surfaceIDs = state.surfaceIDs.joined(separator: ",")
+        AppDelegate.logger.info(
+            "window restore request surfaces=\(surfaceIDs, privacy: .public) focused=\(state.focusedSurface ?? "-", privacy: .public)"
+        )
 
         // The window creation has to go through our terminalManager so that it
         // can be found for events from libghostty. This uses the low-level
@@ -159,6 +170,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             appDelegate.ghostty,
             withSurfaceTree: state.surfaceTree)
         guard let window = c.window else {
+            AppDelegate.logger.warning("window restore failed surfaces=\(surfaceIDs, privacy: .public) reason=window-did-not-load")
             completionHandler(nil, TerminalRestoreError.windowDidNotLoad)
             return
         }
@@ -181,7 +193,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             }
 
             if let view = foundView {
-                c.focusedSurface = view
+                c.focusedSurfaceDidChange(to: view)
                 restoreFocus(to: view, inWindow: window)
             }
         }
@@ -233,4 +245,3 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         }
     }
 }
-

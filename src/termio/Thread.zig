@@ -39,6 +39,9 @@ const sync_reset_ms = 1000;
 /// The number of milliseconds between each movement during selection scrolling.
 const selection_scroll_ms = 15;
 
+/// The debounce interval for persisted scrollback manifest flushes.
+const termination_grace_default_ms = 100;
+
 /// Allocator used for some state
 alloc: std.mem.Allocator,
 
@@ -71,6 +74,17 @@ coalesce_data: Coalesce = .{},
 sync_reset: xev.Timer,
 sync_reset_c: xev.Completion = .{},
 sync_reset_cancel_c: xev.Completion = .{},
+
+/// Debounced background flush for persisted scrollback manifests.
+persisted_scrollback: xev.Timer,
+persisted_scrollback_c: xev.Completion = .{},
+persisted_scrollback_cancel_c: xev.Completion = .{},
+
+/// Timer used to bound the graceful child shutdown drain on termination.
+termination_grace: xev.Timer,
+termination_grace_c: xev.Completion = .{},
+termination_grace_cancel_c: xev.Completion = .{},
+termination_request_id: u64 = 0,
 
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
@@ -111,6 +125,14 @@ pub fn init(
     var sync_reset_h = try xev.Timer.init();
     errdefer sync_reset_h.deinit();
 
+    // This timer debounces persisted scrollback flushes.
+    var persisted_scrollback_h = try xev.Timer.init();
+    errdefer persisted_scrollback_h.deinit();
+
+    // This timer bounds graceful shutdown drainage during termination.
+    var termination_grace_h = try xev.Timer.init();
+    errdefer termination_grace_h.deinit();
+
     return Thread{
         .alloc = alloc,
         .loop = loop,
@@ -118,6 +140,8 @@ pub fn init(
         .scroll = scroll_h,
         .coalesce = coalesce_h,
         .sync_reset = sync_reset_h,
+        .persisted_scrollback = persisted_scrollback_h,
+        .termination_grace = termination_grace_h,
     };
 }
 
@@ -127,6 +151,8 @@ pub fn deinit(self: *Thread) void {
     self.scroll.deinit();
     self.coalesce.deinit();
     self.sync_reset.deinit();
+    self.persisted_scrollback.deinit();
+    self.termination_grace.deinit();
     self.stop.deinit();
     self.loop.deinit();
 }
@@ -318,6 +344,8 @@ fn drainMailbox(
                 try io.changeConfig(data, config.ptr);
             },
             .inspector => |v| self.flags.has_inspector = v,
+            .persisted_scrollback_dirty => |v| self.startPersistedScrollbackTimer(cb, v.immediate),
+            .prepare_termination => |v| self.prepareTermination(cb, v),
             .resize => |v| self.handleResize(cb, v),
             .size_report => |v| try io.sizeReport(data, v),
             .clear_screen => |v| try io.clearScreen(data, v.history),
@@ -370,6 +398,49 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
         CallbackData,
         cb,
         syncResetCallback,
+    );
+}
+
+fn startPersistedScrollbackTimer(self: *Thread, cb: *CallbackData, immediate: bool) void {
+    self.startPersistedScrollbackTimerDelay(
+        cb,
+        if (immediate) 1 else termio.Termio.persisted_scrollback_debounce_ms,
+    );
+}
+
+fn startPersistedScrollbackTimerDelay(self: *Thread, cb: *CallbackData, delay_ms: u64) void {
+    self.persisted_scrollback.reset(
+        &self.loop,
+        &self.persisted_scrollback_c,
+        &self.persisted_scrollback_cancel_c,
+        delay_ms,
+        CallbackData,
+        cb,
+        persistedScrollbackCallback,
+    );
+}
+
+fn prepareTermination(
+    self: *Thread,
+    cb: *CallbackData,
+    req: @FieldType(termio.Message, "prepare_termination"),
+) void {
+    self.termination_request_id = req.request_id;
+
+    cb.io.backend.beginGracefulShutdown();
+
+    const grace_ms = if (req.grace_ms == 0)
+        termination_grace_default_ms
+    else
+        req.grace_ms;
+    self.termination_grace.reset(
+        &self.loop,
+        &self.termination_grace_c,
+        &self.termination_grace_cancel_c,
+        grace_ms,
+        CallbackData,
+        cb,
+        terminationGraceCallback,
     );
 }
 
@@ -464,7 +535,89 @@ fn stopCallback(
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     _ = r catch unreachable;
-    cb_.?.self.loop.stop();
+    const cb = cb_.?;
+    // Surface stop is a final checkpoint; don't apply cadence-only lazy skips.
+    cb.io.flushPersistedScrollback(.{ .is_final_flush = true }) catch |err| {
+        log.warn("error flushing persisted scrollback during stop err={}", .{err});
+    };
+    cb.self.loop.stop();
+    return .disarm;
+}
+
+fn persistedScrollbackCallback(
+    cb_: ?*CallbackData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        error.Canceled => {},
+        else => {
+            log.warn("error during persisted scrollback callback err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const cb = cb_ orelse return .disarm;
+    switch (cb.io.persistedScrollbackTimerDecision()) {
+        .none => {},
+        .skip => {
+            log.debug("persisted scrollback flush reason=background_skip", .{});
+        },
+        .flush => {
+            log.debug("persisted scrollback flush reason=background", .{});
+            cb.io.persistedScrollbackFlushStarted();
+            // Timer-driven flushes keep lazy-first-write suppression.
+            cb.io.flushPersistedScrollback(.{}) catch |err| {
+                log.warn("error flushing persisted scrollback err={}", .{err});
+                const retry_ms = cb.io.persistedScrollbackFlushFailed();
+                cb.self.startPersistedScrollbackTimerDelay(cb, retry_ms);
+            };
+        },
+        .reschedule => |delay_ms| {
+            log.debug(
+                "persisted scrollback flush reason=background_reschedule delay_ms={}",
+                .{delay_ms},
+            );
+            cb.self.startPersistedScrollbackTimerDelay(cb, delay_ms);
+        },
+    }
+    return .disarm;
+}
+
+fn terminationGraceCallback(
+    cb_: ?*CallbackData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        error.Canceled => {},
+        else => {
+            log.warn("error during termination grace callback err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const cb = cb_ orelse return .disarm;
+    const request_id = cb.self.termination_request_id;
+    log.info("persisted scrollback flush reason=termination request_id={}", .{request_id});
+
+    cb.io.persistedScrollbackFlushStarted();
+    const result: termio.Termio.TerminationResult = result: {
+        // Termination is a final checkpoint; don't apply cadence-only lazy skips.
+        cb.io.flushPersistedScrollback(.{ .is_final_flush = true }) catch |err| {
+            log.warn("error flushing persisted scrollback during termination err={}", .{err});
+            break :result .flush_failed;
+        };
+        break :result .flushed;
+    };
+    log.info(
+        "persisted scrollback flush reason=termination_complete request_id={} result={}",
+        .{ request_id, result },
+    );
+    cb.io.completeTermination(request_id, result);
+    cb.self.loop.stop();
     return .disarm;
 }
 

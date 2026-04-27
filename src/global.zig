@@ -11,10 +11,28 @@ const crash = @import("crash/main.zig");
 const renderer = @import("renderer.zig");
 const apprt = @import("apprt.zig");
 
+var graceful_shutdown_requested: std.atomic.Value(bool) = .init(false);
+
 /// We export the xev backend we want to use so that the rest of
 /// Ghostty can import this once and have access to the proper
 /// backend.
 pub const xev = @import("xev").Dynamic;
+
+pub fn requestGracefulShutdown() void {
+    graceful_shutdown_requested.store(true, .monotonic);
+}
+
+pub fn consumeGracefulShutdownRequest() bool {
+    return graceful_shutdown_requested.swap(false, .monotonic);
+}
+
+fn resetGracefulShutdownRequestForTest() void {
+    graceful_shutdown_requested.store(false, .monotonic);
+}
+
+fn gracefulShutdownSignalHandler(_: c_int) callconv(.c) void {
+    requestGracefulShutdown();
+}
 
 /// Global process state. This is initialized in main() for exe artifacts
 /// and by ghostty_init() for lib artifacts. This should ONLY be used by
@@ -213,6 +231,14 @@ pub const GlobalState = struct {
         // be fixed one day but for now this helps make this a bit more
         // robust.
         p.sigaction(p.SIG.PIPE, &sa, null);
+
+        const graceful_shutdown_sa: p.Sigaction = .{
+            .handler = .{ .handler = gracefulShutdownSignalHandler },
+            .mask = p.sigemptyset(),
+            .flags = 0,
+        };
+        p.sigaction(p.SIG.TERM, &graceful_shutdown_sa, null);
+        p.sigaction(p.SIG.INT, &graceful_shutdown_sa, null);
     }
 };
 
@@ -233,3 +259,14 @@ pub const ResourceLimits = struct {
         if (self.nofile) |lim| internal_os.restoreMaxFiles(lim);
     }
 };
+
+test "graceful shutdown request flag is one-shot" {
+    const testing = std.testing;
+
+    resetGracefulShutdownRequestForTest();
+    try testing.expect(!consumeGracefulShutdownRequest());
+
+    requestGracefulShutdown();
+    try testing.expect(consumeGracefulShutdownRequest());
+    try testing.expect(!consumeGracefulShutdownRequest());
+}

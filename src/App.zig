@@ -15,6 +15,7 @@ const Config = configpkg.Config;
 const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
 const renderer = @import("renderer.zig");
 const font = @import("font/main.zig");
+const global = @import("global.zig");
 
 const log = std.log.scoped(.app);
 
@@ -25,6 +26,9 @@ alloc: Allocator,
 
 /// The list of surfaces that are currently active.
 surfaces: SurfaceList,
+
+/// Synchronizes cross-thread snapshots of the active surface list.
+surfaces_mutex: std.Thread.Mutex = .{},
 
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
@@ -127,6 +131,12 @@ pub fn destroy(self: *App) void {
 /// events. This should be called by the application runtime on every loop
 /// tick.
 pub fn tick(self: *App, rt_app: *apprt.App) !void {
+    if (global.consumeGracefulShutdownRequest()) {
+        log.info("graceful shutdown requested by signal", .{});
+        try self.performAction(rt_app, .quit);
+        return;
+    }
+
     // Drain our mailbox
     try self.drainMailbox(rt_app);
 }
@@ -168,7 +178,11 @@ pub fn addSurface(
     self: *App,
     rt_surface: *apprt.Surface,
 ) Allocator.Error!void {
-    try self.surfaces.append(self.alloc, rt_surface);
+    {
+        self.surfaces_mutex.lock();
+        defer self.surfaces_mutex.unlock();
+        try self.surfaces.append(self.alloc, rt_surface);
+    }
 
     // Since we have non-zero surfaces, we can cancel the quit timer.
     // It is up to the apprt if there is a quit timer at all and if it
@@ -195,19 +209,26 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
         }
     }
 
-    var i: usize = 0;
-    while (i < self.surfaces.items.len) {
-        if (self.surfaces.items[i] == rt_surface) {
-            _ = self.surfaces.swapRemove(i);
-            continue;
+    const was_empty = was_empty: {
+        self.surfaces_mutex.lock();
+        defer self.surfaces_mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.surfaces.items.len) {
+            if (self.surfaces.items[i] == rt_surface) {
+                _ = self.surfaces.swapRemove(i);
+                continue;
+            }
+
+            i += 1;
         }
 
-        i += 1;
-    }
+        break :was_empty self.surfaces.items.len == 0;
+    };
 
     // If we have no surfaces, we can start the quit timer. It is up to the
     // apprt to determine if this is necessary.
-    if (self.surfaces.items.len == 0) _ = rt_surface.rtApp().performAction(
+    if (was_empty) _ = rt_surface.rtApp().performAction(
         .app,
         .quit_timer,
         .start,

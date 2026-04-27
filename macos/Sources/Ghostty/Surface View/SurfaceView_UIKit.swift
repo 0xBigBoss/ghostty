@@ -25,7 +25,8 @@ extension Ghostty {
             super.init(id: uuid, frame: CGRect(x: 0, y: 0, width: 800, height: 600))
 
             // Setup our surface. This will also initialize all the terminal IO.
-            let surface_cfg = baseConfig ?? SurfaceConfiguration()
+            var surface_cfg = baseConfig ?? SurfaceConfiguration()
+            surface_cfg.surfaceUUID = self.id.uuidString
             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                 ghostty_surface_new(app, &surface_cfg_c)
             }

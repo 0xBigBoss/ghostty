@@ -36,6 +36,19 @@ pub const Message = union(enum) {
     /// Activate or deactivate the inspector.
     inspector: bool,
 
+    /// Mark persisted scrollback dirty and schedule a background flush.
+    persisted_scrollback_dirty: struct {
+        /// Lifecycle events should flush as soon as the IO loop processes this
+        /// message; normal terminal output still uses the trailing debounce.
+        immediate: bool = false,
+    },
+
+    /// Prepare the IO side of a surface for process termination.
+    prepare_termination: struct {
+        request_id: u64,
+        grace_ms: u32,
+    },
+
     /// Resize the window.
     resize: renderer.Size,
 

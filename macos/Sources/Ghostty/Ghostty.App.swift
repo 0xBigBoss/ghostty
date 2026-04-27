@@ -78,6 +78,11 @@ extension Ghostty {
             self.app = app
 
 #if os(macOS)
+            let initialAppearance = NSAppearance.ghosttyEffectiveAppearance(for: self.config)
+            ghostty_app_set_color_scheme(app, initialAppearance.ghosttyColorScheme)
+#endif
+
+#if os(macOS)
             // Set our initial focus state
             ghostty_app_set_focus(app, NSApp.isActive)
 
@@ -116,6 +121,11 @@ extension Ghostty {
         func appTick() {
             guard let app = self.app else { return }
             ghostty_app_tick(app)
+        }
+
+        func persistAll(timeoutMs: UInt32) {
+            guard let app = self.app else { return }
+            ghostty_app_persist_all(app, timeoutMs)
         }
 
         private static func openConfig(_ app: ghostty_app_t) {

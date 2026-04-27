@@ -85,6 +85,12 @@ pub const Backend = union(Kind) {
         }
     }
 
+    pub fn beginGracefulShutdown(self: *Backend) void {
+        switch (self.*) {
+            .exec => |*exec| exec.beginGracefulShutdown(),
+        }
+    }
+
     pub fn childExitedAbnormally(
         self: *Backend,
         gpa: Allocator,

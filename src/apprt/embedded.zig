@@ -21,10 +21,49 @@ const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
+const persisted_scrollback = @import("../termio/persisted_scrollback.zig");
+const globalpkg = @import("../global.zig");
+const xev = globalpkg.xev;
+const global_state = &globalpkg.state;
 
 const log = std.log.scoped(.embedded_window);
 
 pub const resourcesDir = internal_os.resourcesDir;
+
+fn snapshotActiveSessionIds(
+    alloc: Allocator,
+    core_app: *CoreApp,
+) Allocator.Error!std.ArrayListUnmanaged([]const u8) {
+    var active_session_ids: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer {
+        for (active_session_ids.items) |session_id| alloc.free(session_id);
+        active_session_ids.deinit(alloc);
+    }
+
+    core_app.surfaces_mutex.lock();
+    defer core_app.surfaces_mutex.unlock();
+
+    for (core_app.surfaces.items) |surface| {
+        const persisted = if (surface.core().io.persisted) |*value| value else continue;
+        const session_id = persisted.session_id orelse continue;
+
+        const copy = try alloc.dupe(u8, session_id);
+        active_session_ids.append(alloc, copy) catch |err| {
+            alloc.free(copy);
+            return err;
+        };
+    }
+
+    return active_session_ids;
+}
+
+fn freeActiveSessionIds(
+    alloc: Allocator,
+    active_session_ids: *std.ArrayListUnmanaged([]const u8),
+) void {
+    for (active_session_ids.items) |session_id| alloc.free(session_id);
+    active_session_ids.deinit(alloc);
+}
 
 pub const App = struct {
     /// Because we only expect the embedding API to be used in embedded
@@ -120,6 +159,12 @@ pub const App = struct {
     core_app: *CoreApp,
     opts: Options,
     keymap: input.Keymap,
+    stale_session_cleanup_loop: xev.Loop,
+    stale_session_cleanup_stop: xev.Async,
+    stale_session_cleanup_stop_c: xev.Completion = .{},
+    stale_session_cleanup_timer: xev.Timer,
+    stale_session_cleanup_timer_c: xev.Completion = .{},
+    stale_session_cleanup_thread: std.Thread,
 
     /// The configuration for the app. This is owned by this structure.
     config: Config,
@@ -138,17 +183,133 @@ pub const App = struct {
         var keymap = try input.Keymap.init();
         errdefer keymap.deinit();
 
+        var stale_session_cleanup_loop = try xev.Loop.init(.{});
+        errdefer stale_session_cleanup_loop.deinit();
+
+        var stale_session_cleanup_stop = try xev.Async.init();
+        errdefer stale_session_cleanup_stop.deinit();
+
+        var stale_session_cleanup_timer = try xev.Timer.init();
+        errdefer stale_session_cleanup_timer.deinit();
+
         self.* = .{
             .core_app = core_app,
             .config = config_clone,
             .opts = opts,
             .keymap = keymap,
+            .stale_session_cleanup_loop = stale_session_cleanup_loop,
+            .stale_session_cleanup_stop = stale_session_cleanup_stop,
+            .stale_session_cleanup_timer = stale_session_cleanup_timer,
+            .stale_session_cleanup_thread = undefined,
         };
+
+        self.stale_session_cleanup_thread = try std.Thread.spawn(
+            .{},
+            staleSessionCleanupThreadMain,
+            .{self},
+        );
+        self.stale_session_cleanup_thread.setName("session-gc") catch {};
     }
 
     pub fn terminate(self: *App) void {
+        self.stale_session_cleanup_stop.notify() catch |err| {
+            log.warn("error notifying stale session cleanup thread to stop err={}", .{err});
+        };
+        self.stale_session_cleanup_thread.join();
+        self.stale_session_cleanup_timer.deinit();
+        self.stale_session_cleanup_stop.deinit();
+        self.stale_session_cleanup_loop.deinit();
         self.keymap.deinit();
         self.config.deinit();
+    }
+
+    fn staleSessionCleanupThreadMain(self: *App) void {
+        self.stale_session_cleanup_stop.wait(
+            &self.stale_session_cleanup_loop,
+            &self.stale_session_cleanup_stop_c,
+            App,
+            self,
+            staleSessionCleanupStopCallback,
+        );
+        self.stale_session_cleanup_timer.run(
+            &self.stale_session_cleanup_loop,
+            &self.stale_session_cleanup_timer_c,
+            persisted_scrollback.stale_session_cleanup_interval_ms,
+            App,
+            self,
+            staleSessionCleanupTimerCallback,
+        );
+
+        self.stale_session_cleanup_loop.run(.until_done) catch |err| {
+            log.warn("stale session cleanup loop failed err={}", .{err});
+        };
+    }
+
+    fn staleSessionCleanupStopCallback(
+        self_: ?*App,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        _ = r catch |err| {
+            log.warn("error during stale session cleanup stop err={}", .{err});
+            return .disarm;
+        };
+        _ = self_ orelse return .disarm;
+
+        loop.stop();
+        return .disarm;
+    }
+
+    fn staleSessionCleanupTimerCallback(
+        self_: ?*App,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        r: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = r catch |err| switch (err) {
+            error.Canceled => return .disarm,
+            else => {
+                log.warn("error during stale session cleanup timer err={}", .{err});
+                return .disarm;
+            },
+        };
+
+        const self = self_ orelse return .disarm;
+        log.debug("stale session cleanup reason=hourly", .{});
+        var active_session_ids = snapshotActiveSessionIds(global_state.alloc, self.core_app) catch |err| {
+            log.warn("stale session cleanup failed reason=hourly_snapshot err={}", .{err});
+            self.stale_session_cleanup_timer.run(
+                loop,
+                completion,
+                persisted_scrollback.stale_session_cleanup_interval_ms,
+                App,
+                self,
+                staleSessionCleanupTimerCallback,
+            );
+            return .disarm;
+        };
+        defer freeActiveSessionIds(global_state.alloc, &active_session_ids);
+
+        _ = persisted_scrollback.cleanupStaleSessionsGuarded(
+            global_state.alloc,
+            persisted_scrollback.retentionSecondsFromDays(
+                self.config.@"scrollback-persist-retention-days",
+            ),
+            active_session_ids.items,
+        ) catch |err| {
+            log.warn("stale session cleanup failed reason=hourly err={}", .{err});
+        };
+
+        self.stale_session_cleanup_timer.run(
+            loop,
+            completion,
+            persisted_scrollback.stale_session_cleanup_interval_ms,
+            App,
+            self,
+            staleSessionCleanupTimerCallback,
+        );
+        return .disarm;
     }
 
     /// Returns true if there are any global keybinds in the configuration.
@@ -449,6 +610,9 @@ pub const Surface = struct {
         /// future once we have a concrete use case.
         command: ?[*:0]const u8 = null,
 
+        /// Stable UUID associated with this surface.
+        surface_uuid: ?[*:0]const u8 = null,
+
         /// Extra environment variables to set for the surface.
         env_vars: ?[*]EnvVar = null,
         env_var_count: usize = 0,
@@ -549,6 +713,23 @@ pub const Surface = struct {
             }
         }
 
+        // A stable TERM_SESSION_ID allows shell-level tooling to correlate
+        // state across restarts.
+        if (opts.surface_uuid) |c_uuid| {
+            const alloc = config.arenaAlloc();
+            const uuid = std.mem.sliceTo(c_uuid, 0);
+            if (uuid.len > 0) {
+                try config.env.map.put(
+                    alloc,
+                    try alloc.dupeZ(u8, "TERM_SESSION_ID"),
+                    try alloc.dupeZ(u8, uuid),
+                );
+            }
+        }
+
+        // Scrollback manifest path is now derived from surface_uuid in the
+        // Zig core (persisted_scrollback.manifestPath). No env var needed.
+
         // If we have an initial input then we set it.
         if (opts.initial_input) |c_input| {
             const alloc = config.arenaAlloc();
@@ -574,6 +755,13 @@ pub const Surface = struct {
             config.@"wait-after-command" = true;
         }
 
+        // Extract session ID before passing to core surface. This avoids
+        // routing the scrollback session identity through the config env map.
+        const session_id: ?[]const u8 = if (opts.surface_uuid) |c_uuid| blk: {
+            const uuid = std.mem.sliceTo(c_uuid, 0);
+            break :blk if (uuid.len > 0) uuid else null;
+        } else null;
+
         // Initialize our surface right away. We're given a view that is
         // ready to use.
         try self.core_surface.init(
@@ -582,6 +770,7 @@ pub const Surface = struct {
             app.core_app,
             app,
             self,
+            .{ .session_id = session_id },
         );
         errdefer self.core_surface.deinit();
 
@@ -1239,6 +1428,70 @@ pub const Inspector = struct {
     }
 };
 
+const PersistAllResult = struct {
+    attempted: usize = 0,
+    failed: usize = 0,
+    skipped: usize = 0,
+};
+
+fn instantSinceSafeNs(later: std.time.Instant, earlier: std.time.Instant) u64 {
+    return switch (later.order(earlier)) {
+        .lt => 0,
+        .eq, .gt => later.since(earlier),
+    };
+}
+
+fn persistAllSurfacesBounded(
+    comptime SurfacePtr: type,
+    comptime Context: type,
+    surfaces: []const SurfacePtr,
+    timeout_ms: u32,
+    context: *Context,
+    flush: *const fn (*Context, SurfacePtr) anyerror!void,
+) PersistAllResult {
+    const total_budget_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    var result: PersistAllResult = .{};
+
+    if (total_budget_ns == 0) {
+        result.skipped = surfaces.len;
+        if (surfaces.len > 0) {
+            log.warn("persist_all budget exhausted skipped_count={}", .{surfaces.len});
+        }
+        return result;
+    }
+
+    const start = std.time.Instant.now() catch null;
+    for (surfaces, 0..) |surface, i| {
+        if (start) |started_at| {
+            if (std.time.Instant.now() catch null) |now| {
+                const elapsed_ns = instantSinceSafeNs(now, started_at);
+                if (elapsed_ns >= total_budget_ns) {
+                    result.skipped = surfaces.len - i;
+                    log.warn("persist_all budget exhausted skipped_count={}", .{result.skipped});
+                    return result;
+                }
+            }
+        }
+
+        result.attempted += 1;
+        flush(context, surface) catch |err| {
+            result.failed += 1;
+            log.warn("error flushing persisted scrollback during app persist all err={}", .{err});
+        };
+    }
+
+    return result;
+}
+
+const PersistAllFlushContext = struct {};
+
+fn persistAllFlush(
+    _: *PersistAllFlushContext,
+    surface: *apprt.Surface,
+) !void {
+    try surface.core().io.flushPersistedScrollback(.{ .is_final_flush = true });
+}
+
 // C API
 pub const CAPI = struct {
     const global = &@import("../global.zig").state;
@@ -1418,6 +1671,18 @@ pub const CAPI = struct {
         try app.init(core_app, config, opts.*);
         errdefer app.terminate();
 
+        // Startup cleanup handles stale sessions left behind by prior Ghostty
+        // runs before newly restored sessions begin refreshing their state.
+        _ = persisted_scrollback.cleanupStaleSessionsGuarded(
+            global_state.alloc,
+            persisted_scrollback.retentionSecondsFromDays(
+                config.@"scrollback-persist-retention-days",
+            ),
+            &.{},
+        ) catch |err| {
+            log.warn("stale session cleanup failed reason=startup err={}", .{err});
+        };
+
         return app;
     }
 
@@ -1427,6 +1692,25 @@ pub const CAPI = struct {
         v.core_app.tick(v) catch |err| {
             log.err("error app tick err={}", .{err});
         };
+    }
+
+    export fn ghostty_app_persist_all(v: *App, timeout_ms: u32) void {
+        // Holding the app surface list lock keeps the raw surface pointers
+        // alive while each final flush runs. This can delay add/deleteSurface
+        // for up to the app-level timeout, which is acceptable for the
+        // termination-handler path this API is designed for.
+        v.core_app.surfaces_mutex.lock();
+        defer v.core_app.surfaces_mutex.unlock();
+
+        var context: PersistAllFlushContext = .{};
+        _ = persistAllSurfacesBounded(
+            *apprt.Surface,
+            PersistAllFlushContext,
+            v.core_app.surfaces.items,
+            timeout_ms,
+            &context,
+            persistAllFlush,
+        );
     }
 
     /// Return the userdata associated with the app.
@@ -1558,6 +1842,14 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free(ptr: *Surface) void {
         ptr.app.closeSurface(ptr);
+    }
+
+    export fn ghostty_surface_prepare_for_quit(
+        ptr: *Surface,
+        grace_ms: u32,
+        timeout_ms: u32,
+    ) bool {
+        return ptr.core().prepareForQuit(grace_ms, timeout_ms);
     }
 
     /// Returns the userdata associated with the surface.
@@ -2247,3 +2539,62 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "ghostty.h surface config has surface_uuid for session identity" {
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+
+    // The core derives the manifest path from surface_uuid using XDG
+    // state conventions. No separate manifest path field is needed.
+    try testing.expect(@hasField(c.ghostty_surface_config_s, "surface_uuid"));
+    try testing.expect(@hasDecl(c, "ghostty_app_persist_all"));
+    try testing.expect(!@hasDecl(c, "ghostty_surface_export_snapshot"));
+}
+
+const PersistAllTestSurface = struct {
+    flushed: bool = false,
+};
+
+const PersistAllTestContext = struct {
+    attempts: usize = 0,
+};
+
+fn persistAllTestFlush(
+    context: *PersistAllTestContext,
+    surface: *PersistAllTestSurface,
+) !void {
+    context.attempts += 1;
+    surface.flushed = true;
+
+    // Per-surface flushes run to completion. The app-level budget is checked
+    // before each surface, so a slow flush causes remaining surfaces to be
+    // skipped on the next iteration.
+    std.time.sleep(20 * std.time.ns_per_ms);
+}
+
+test "ghostty_app_persist_all budget skips surfaces after timeout" {
+    const testing = std.testing;
+
+    var surfaces: [3]PersistAllTestSurface = .{ .{}, .{}, .{} };
+    var context: PersistAllTestContext = .{};
+
+    const timeout_ms: u32 = 5;
+    const start = try std.time.Instant.now();
+    const result = persistAllSurfacesBounded(
+        *PersistAllTestSurface,
+        PersistAllTestContext,
+        surfaces[0..],
+        timeout_ms,
+        &context,
+        persistAllTestFlush,
+    );
+    const elapsed_ns = (try std.time.Instant.now()).since(start);
+
+    try testing.expect(elapsed_ns < (@as(u64, timeout_ms + 200) * std.time.ns_per_ms));
+    try testing.expectEqual(@as(usize, 1), result.attempted);
+    try testing.expectEqual(@as(usize, 2), result.skipped);
+    try testing.expect(surfaces[0].flushed);
+    try testing.expect(!surfaces[1].flushed);
+    try testing.expect(!surfaces[2].flushed);
+    try testing.expectEqual(@as(usize, 1), context.attempts);
+}

@@ -99,6 +99,12 @@ extension Ghostty {
             self.childExitedMessage = message
         }
 
+        @MainActor
+        func prepareForQuit(graceMs: UInt32, timeoutMs: UInt32) -> Bool {
+            guard let surface else { return true }
+            return ghostty_surface_prepare_for_quit(surface, graceMs, timeoutMs)
+        }
+
         // MARK: - Placeholders
 
         func focusDidChange(_ focused: Bool) {}
