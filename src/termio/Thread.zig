@@ -560,6 +560,9 @@ fn persistedScrollbackCallback(
     const cb = cb_ orelse return .disarm;
     switch (cb.io.persistedScrollbackTimerDecision()) {
         .none => {},
+        .skip => {
+            log.debug("persisted scrollback flush reason=background_skip", .{});
+        },
         .flush => {
             log.debug("persisted scrollback flush reason=background", .{});
             cb.io.persistedScrollbackFlushStarted();

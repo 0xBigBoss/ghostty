@@ -37,6 +37,8 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - REQ-SNAPSHOT-015: Surface focus loss must schedule an already-dirty persisted scrollback state for the next immediate background flush without performing disk IO in the focus callback.
 - REQ-SNAPSHOT-016: SIGTERM and SIGINT must request graceful app shutdown through an async-signal-safe flag that the app loop consumes.
 - REQ-SNAPSHOT-017: The embedded C API must expose an app-wide persisted scrollback flush entry point for native lifecycle delegates to call before process teardown.
+- REQ-SNAPSHOT-018: Persisted scrollback must skip the first write until the terminal session has existed for at least ten seconds and has emitted content.
+- REQ-SNAPSHOT-019: Persisted scrollback must skip background writes for dirty sessions that have been idle for at least two seconds unless the dirty state has reached the maximum staleness limit.
 
 ## Invariants
 
@@ -46,6 +48,7 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - A failed persisted scrollback write must not silently leave the surface permanently stale.
 - Stale session cleanup must not run on the renderer thread.
 - Signal handlers must not call non-async-signal-safe persistence or app teardown code directly.
+- Lazy first-write and idle skip thresholds are internal timing policy, not user-facing persisted scrollback configuration.
 
 ## Non-goals
 
@@ -55,6 +58,7 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - Turning termination flushing into a best-effort free path that depends on ARC timing alone.
 - Making stale session retention configurable.
 - Wiring macOS Swift `applicationWillTerminate`.
+- Adding config knobs for lazy first-write or idle skip timing.
 
 ## Acceptance Criteria
 
@@ -68,6 +72,8 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - [ ] Losing focus with dirty persisted scrollback schedules an immediate flush decision.
 - [ ] SIGTERM or SIGINT exits through the normal app quit path instead of flushing from the signal handler.
 - [ ] Native embedders can call `ghostty_app_persist_all` before application termination.
+- [ ] Short-lived sessions under ten seconds with terminal output do not create a persisted session directory.
+- [ ] Background persisted scrollback does not write during two-second idle windows unless max staleness requires a write.
 
 ## Test Traceability
 
@@ -75,3 +81,6 @@ The solution is to make persisted scrollback lifecycle ownership explicit:
 - REQ-SNAPSHOT-015: `src/termio/Termio.zig` test `persisted scrollback lifecycle request flushes dirty state immediately`
 - REQ-SNAPSHOT-016: `src/global.zig` test `graceful shutdown request flag is one-shot`
 - REQ-SNAPSHOT-017: `src/apprt/embedded.zig` test `ghostty.h surface config has surface_uuid for session identity`
+- REQ-SNAPSHOT-018: `src/termio/Termio.zig` test `persisted scrollback schedule skips first write before lazy threshold`
+- REQ-SNAPSHOT-018: `src/termio/Termio.zig` test `persisted scrollback capture skips first write before lazy threshold`
+- REQ-SNAPSHOT-019: `src/termio/Termio.zig` test `persisted scrollback schedule skips idle dirty state`

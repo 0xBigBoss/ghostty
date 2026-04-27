@@ -171,6 +171,7 @@ const PersistedState = struct {
     dirty: bool = false,
     dirty_generation: u64 = 0,
     notify_pending: bool = false,
+    created_at: ?std.time.Instant = null,
     dirty_started_at: ?std.time.Instant = null,
     last_dirty_at: ?std.time.Instant = null,
     retry_count: u8 = 0,
@@ -199,12 +200,6 @@ const PersistedState = struct {
         const session_dir = try persisted_scrollback.sessionDirPath(alloc, sid);
         errdefer alloc.free(session_dir);
 
-        // Ensure the session directory exists so publish can write to it.
-        persisted_scrollback.ensureSessionDir(session_dir) catch |err| {
-            log.warn("persisted scrollback save disabled reason=dir-create-failed err={}", .{err});
-            alloc.free(session_dir);
-            return null;
-        };
         const scrollback_size_bytes = persistedScrollbackFileSize(session_dir) catch |err| size: {
             if (err != error.FileNotFound) {
                 log.warn("persisted scrollback size unavailable dir={s} err={}", .{ session_dir, err });
@@ -230,6 +225,7 @@ const PersistedState = struct {
                 .cols = v.header.cols,
                 .rows = v.header.rows,
             } else null,
+            .created_at = std.time.Instant.now() catch null,
         };
     }
 
@@ -247,6 +243,8 @@ const PersistedHeaderDims = struct {
 
 pub const persisted_scrollback_debounce_ms = 400;
 const persisted_scrollback_max_staleness_ms = 2_000;
+const persisted_scrollback_lazy_first_write_ms = 10_000;
+const persisted_scrollback_idle_skip_ms = 2_000;
 const persisted_scrollback_retry_base_ms = 250;
 const persisted_scrollback_retry_cap_ms = 2_000;
 
@@ -306,26 +304,58 @@ const TerminationState = struct {
 
 const PersistedScheduleState = struct {
     dirty: bool,
+    header_written: bool = true,
+    first_write_age_ms: ?u64 = null,
     dirty_age_ms: u64,
     idle_ms: u64,
 };
 
 const PersistedScheduleDecision = union(enum) {
     none,
+    skip,
     flush,
     reschedule: u64,
 };
+
+fn persistedScrollbackShouldSkipFlush(state: PersistedScheduleState) bool {
+    if (!state.dirty) return true;
+    if (!state.header_written) {
+        const age_ms = state.first_write_age_ms orelse return false;
+        return age_ms < persisted_scrollback_lazy_first_write_ms;
+    }
+
+    // Max staleness is a starvation guard. It wins over idle suppression so a
+    // dirty terminal cannot remain dirty forever after one quiet window.
+    if (state.dirty_age_ms >= persisted_scrollback_max_staleness_ms) return false;
+    return state.idle_ms > persisted_scrollback_idle_skip_ms;
+}
 
 fn persistedScrollbackScheduleDecision(
     state: PersistedScheduleState,
 ) PersistedScheduleDecision {
     if (!state.dirty) return .none;
+    if (persistedScrollbackShouldSkipFlush(state)) return .skip;
     if (state.dirty_age_ms >= persisted_scrollback_max_staleness_ms) return .flush;
     if (state.idle_ms >= persisted_scrollback_debounce_ms) return .flush;
 
     const quiet_remaining = persisted_scrollback_debounce_ms - state.idle_ms;
     const stale_remaining = persisted_scrollback_max_staleness_ms - state.dirty_age_ms;
     return .{ .reschedule = @max(@as(u64, 1), @min(quiet_remaining, stale_remaining)) };
+}
+
+fn persistedScrollbackGateState(
+    persisted: *const PersistedState,
+    now: std.time.Instant,
+) PersistedScheduleState {
+    const dirty_started_at = persisted.dirty_started_at orelse now;
+    const last_dirty_at = persisted.last_dirty_at orelse dirty_started_at;
+    return .{
+        .dirty = persisted.dirty,
+        .header_written = persisted.header_written,
+        .first_write_age_ms = instantAgeMs(now, persisted.created_at),
+        .dirty_age_ms = @intCast(now.since(dirty_started_at) / std.time.ns_per_ms),
+        .idle_ms = @intCast(now.since(last_dirty_at) / std.time.ns_per_ms),
+    };
 }
 
 fn persistedScrollbackRetryDelayMs(retry_count: u8) u64 {
@@ -351,6 +381,11 @@ fn instantSubtractNs(instant: std.time.Instant, ns: u64) std.time.Instant {
         },
     }
     return result;
+}
+
+fn instantAgeMs(now: std.time.Instant, then: ?std.time.Instant) ?u64 {
+    const start = then orelse return null;
+    return @intCast(now.since(start) / std.time.ns_per_ms);
 }
 
 fn requestPersistedScrollbackLifecycleFlushLocked(
@@ -1204,13 +1239,14 @@ pub fn persistedScrollbackTimerDecision(self: *Termio) PersistedScheduleDecision
         return .none;
     }
 
-    const dirty_started_at = persisted.dirty_started_at orelse now;
-    const last_dirty_at = persisted.last_dirty_at orelse dirty_started_at;
-    return persistedScrollbackScheduleDecision(.{
-        .dirty = persisted.dirty,
-        .dirty_age_ms = @intCast(now.since(dirty_started_at) / std.time.ns_per_ms),
-        .idle_ms = @intCast(now.since(last_dirty_at) / std.time.ns_per_ms),
-    });
+    const decision = persistedScrollbackScheduleDecision(
+        persistedScrollbackGateState(persisted, now),
+    );
+    switch (decision) {
+        .skip => persisted.notify_pending = false,
+        else => {},
+    }
+    return decision;
 }
 
 pub fn persistedScrollbackFlushStarted(self: *Termio) void {
@@ -1348,6 +1384,15 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
 
     const persisted = if (self.persisted) |*value| value else return null;
     if (!persisted.dirty) return null;
+
+    if (std.time.Instant.now()) |now| {
+        if (persistedScrollbackShouldSkipFlush(
+            persistedScrollbackGateState(persisted, now),
+        )) return null;
+    } else |_| {
+        // If monotonic time is unavailable, prefer preserving data over
+        // applying timing-only IO suppression.
+    }
 
     const snapshot = terminalpkg.snapshot;
     const primary = self.terminal.screens.get(.primary) orelse self.terminal.screens.active;
@@ -2195,6 +2240,36 @@ test "persisted scrollback schedule waits for trailing debounce" {
     );
 }
 
+test "persisted scrollback schedule skips first write before lazy threshold" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        PersistedScheduleDecision.skip,
+        persistedScrollbackScheduleDecision(.{
+            .dirty = true,
+            .header_written = false,
+            .first_write_age_ms = 9_999,
+            .dirty_age_ms = 100,
+            .idle_ms = 100,
+        }),
+    );
+}
+
+test "persisted scrollback schedule debounces first write after lazy threshold" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        PersistedScheduleDecision{ .reschedule = 300 },
+        persistedScrollbackScheduleDecision(.{
+            .dirty = true,
+            .header_written = false,
+            .first_write_age_ms = 10_000,
+            .dirty_age_ms = 100,
+            .idle_ms = 100,
+        }),
+    );
+}
+
 test "persisted scrollback schedule flushes at max staleness" {
     const testing = std.testing;
 
@@ -2204,6 +2279,32 @@ test "persisted scrollback schedule flushes at max staleness" {
             .dirty = true,
             .dirty_age_ms = 2_000,
             .idle_ms = 50,
+        }),
+    );
+}
+
+test "persisted scrollback schedule skips idle dirty state" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        PersistedScheduleDecision.skip,
+        persistedScrollbackScheduleDecision(.{
+            .dirty = true,
+            .dirty_age_ms = 1_999,
+            .idle_ms = 2_001,
+        }),
+    );
+}
+
+test "persisted scrollback schedule flushes stale state even when idle" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        PersistedScheduleDecision.flush,
+        persistedScrollbackScheduleDecision(.{
+            .dirty = true,
+            .dirty_age_ms = 2_000,
+            .idle_ms = 2_001,
         }),
     );
 }
@@ -2219,6 +2320,47 @@ test "persisted scrollback schedule flushes after quiet debounce" {
             .idle_ms = 400,
         }),
     );
+}
+
+test "persisted scrollback capture skips first write before lazy threshold" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const session_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "lazy-session" });
+    defer testing.allocator.free(session_path);
+    const session_dir = try testing.allocator.dupe(u8, session_path);
+
+    var terminal = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback = 100,
+    });
+
+    var mutex = std.Thread.Mutex{};
+    var state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &terminal,
+    };
+    var io = persistedTestTermio(testing.allocator, session_dir, terminal, &state, 1024);
+    state.terminal = &io.terminal;
+    defer {
+        if (io.persisted) |*persisted| persisted.deinit(testing.allocator);
+        io.terminal.deinit(testing.allocator);
+    }
+
+    const now = try std.time.Instant.now();
+    io.persisted.?.created_at = now;
+    io.persisted.?.header_written = false;
+
+    try io.terminal.printString("short-lived output\n");
+    try io.flushPersistedScrollback();
+
+    try testing.expectError(error.FileNotFound, tmp_dir.dir.statFile("lazy-session"));
+    try testing.expect(io.persisted.?.dirty);
 }
 
 test "persisted scrollback lifecycle request flushes dirty state immediately" {
