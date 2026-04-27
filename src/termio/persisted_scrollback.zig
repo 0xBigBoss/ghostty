@@ -108,8 +108,6 @@ pub fn publish(
         try writeScrollbackRecords(&buf.writer, capture.scrollback_first_seq, capture.scrollback_append);
         try writeFileAtomic(&dir, "scrollback", buf.writer.buffer[0..buf.writer.end]);
     } else if (capture.scrollback_append.len > 0) {
-        // Open existing logs without truncation so each flush extends the
-        // append-only record stream. Create the file only for the first record.
         var file = dir.openFile("scrollback", .{ .mode = .write_only }) catch |err| switch (err) {
             error.FileNotFound => try dir.createFile("scrollback", .{
                 .truncate = false,
@@ -120,10 +118,14 @@ pub fn publish(
         defer file.close();
         try file.seekFromEnd(0);
 
-        var buf: [64 * 1024]u8 = undefined;
-        var writer = file.writer(&buf);
-        try writeScrollbackRecords(&writer.interface, capture.scrollback_first_seq, capture.scrollback_append);
-        try writer.interface.flush();
+        // Serialize records into a heap buffer, then writeAll. The buffered
+        // std.Io.Writer interface tracks its own pos starting at 0 and ignores
+        // the file's kernel seek cursor (it uses pwrite under the hood), so we
+        // write directly via the legacy file API to honor seekFromEnd.
+        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer buf.deinit();
+        try writeScrollbackRecords(&buf.writer, capture.scrollback_first_seq, capture.scrollback_append);
+        try file.writeAll(buf.writer.buffer[0..buf.writer.end]);
     }
 
     if (capture.screen) |screen| {
