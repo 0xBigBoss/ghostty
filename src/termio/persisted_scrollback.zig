@@ -1594,7 +1594,28 @@ test "append-on-eviction over multiple ticks appends only new bytes" {
     });
 
     const size_after_second = try fileSize(&dir, "scrollback");
-    try testing.expectEqual(size_after_first + scrollback_record_prefix_size + second.len, size_after_second);
+    const uncompressed_second_size: u64 = @intCast(scrollback_record_prefix_size + second.len);
+    // A gzip member has a small fixed envelope, so allow that while still
+    // proving the append stayed bounded below the raw record size.
+    const small_header_slack: u64 = 32;
+    try testing.expect(size_after_second > size_after_first);
+    try testing.expect(size_after_second < size_after_first + uncompressed_second_size + small_header_slack);
+
+    const expected_scrollback = try writeScreenBytes(testing.allocator, screen, 0, 2);
+    defer testing.allocator.free(expected_scrollback);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
+    defer loaded.deinit(testing.allocator);
+    try expectScrollbackPrefixEqual(testing.allocator, &loaded, expected_scrollback);
+
+    var expected_active = try snapshot.readScreenData(testing.allocator, active);
+    defer expected_active.deinit(testing.allocator);
+    try testing.expectEqual(loaded.scrollback_rows + expected_active.rows.len, loaded.primary.rows.len);
+    for (expected_active.rows, loaded.primary.rows[loaded.scrollback_rows..]) |expected_row, actual_row| {
+        try testing.expectEqual(expected_row.wrap, actual_row.wrap);
+        try testing.expectEqual(expected_row.wrap_continuation, actual_row.wrap_continuation);
+        try testing.expectEqual(expected_row.semantic_prompt, actual_row.semantic_prompt);
+        try testing.expectEqualSlices(u64, expected_row.cells, actual_row.cells);
+    }
 }
 
 test "publish skips scrollback records already advanced on disk" {
@@ -1714,6 +1735,7 @@ test "publish skips oversized screen files and keeps existing files" {
     @memset(oversized, 'x');
 
     const progress = try publish(session_path, .{
+        .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .scrollback_append = &.{.{ .bytes = "scrollback-row" }},
         .scrollback_first_seq = 0,
         .screen = oversized,
