@@ -1116,6 +1116,10 @@ fn markPersistedScrollbackDirtyLocked(self: *Termio) void {
     const persisted = if (self.persisted) |*value| value else return;
     const now = std.time.Instant.now() catch return;
 
+    // Flush reconciliation uses this generation to distinguish the captured
+    // state from resize/dirty events that happen while publish runs without
+    // the renderer lock. Monotonic disk advances may still be recorded after a
+    // mismatch, but invalidation and dirty flags are only cleared on a match.
     if (!persisted.dirty) persisted.dirty_started_at = now;
     persisted.dirty = true;
     persisted.last_dirty_at = now;
@@ -1440,6 +1444,57 @@ fn capturePersistedScrollback(self: *Termio) !?PersistedCapture {
     };
 }
 
+fn persistedSizeFromProgress(size: u64) usize {
+    return std.math.cast(usize, size) orelse std.math.maxInt(usize);
+}
+
+fn applyPersistedPublishProgress(
+    value: *PersistedState,
+    capture: *const PersistedCapture,
+    progress: persisted_scrollback.PublishProgress,
+    publish_succeeded: bool,
+) void {
+    if (publish_succeeded) {
+        value.retry_count = 0;
+        value.last_persisted_row_count = capture.next_row_count;
+        value.last_persisted_seq = if (progress.scrollback_appended)
+            progress.scrollback_tail_seq_after
+        else
+            capture.next_tail_seq;
+        value.next_seq = capture.next_seq;
+        value.scrollback_size_bytes = if (progress.scrollback_appended)
+            persistedSizeFromProgress(progress.scrollback_size_after)
+        else
+            capture.scrollback_size_bytes;
+        value.header_written = capture.header_written;
+        if (capture.header_dims) |dims| value.last_header_dims = dims;
+        value.last_metadata_hash = capture.metadata_hash;
+
+        if (value.dirty_generation == capture.generation) {
+            value.scrollback_invalidated = false;
+            value.dirty = false;
+            value.dirty_started_at = null;
+            value.last_dirty_at = null;
+        }
+        return;
+    }
+
+    if (progress.header_written) {
+        value.header_written = true;
+        if (capture.header_dims) |dims| value.last_header_dims = dims;
+    }
+    if (progress.metadata_written) value.last_metadata_hash = capture.metadata_hash;
+    if (progress.scrollback_appended) {
+        value.last_persisted_row_count = capture.next_row_count;
+        value.last_persisted_seq = progress.scrollback_tail_seq_after;
+        value.next_seq = if (progress.scrollback_record_count_after > 0)
+            progress.scrollback_tail_seq_after +% 1
+        else
+            0;
+        value.scrollback_size_bytes = persistedSizeFromProgress(progress.scrollback_size_after);
+    }
+}
+
 pub fn flushPersistedScrollback(self: *Termio) !void {
     self.renderer_state.mutex.lock();
     if (self.persisted) |*persisted| {
@@ -1457,25 +1512,20 @@ pub fn flushPersistedScrollback(self: *Termio) !void {
     defer capture.deinit(self.alloc);
 
     const persisted = self.persisted orelse return;
-    try persisted_scrollback.publish(persisted.session_dir, capture.capture);
+    var progress: persisted_scrollback.PublishProgress = .{};
+    errdefer {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        if (self.persisted) |*value| {
+            applyPersistedPublishProgress(value, &capture, progress, false);
+        }
+    }
+    try persisted_scrollback.publishWithProgress(persisted.session_dir, capture.capture, &progress);
 
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     if (self.persisted) |*value| {
-        value.retry_count = 0;
-        value.last_persisted_row_count = capture.next_row_count;
-        value.last_persisted_seq = capture.next_tail_seq;
-        value.next_seq = capture.next_seq;
-        value.scrollback_size_bytes = capture.scrollback_size_bytes;
-        value.scrollback_invalidated = false;
-        value.header_written = capture.header_written;
-        if (capture.header_dims) |dims| value.last_header_dims = dims;
-        value.last_metadata_hash = capture.metadata_hash;
-        if (value.dirty_generation == capture.generation) {
-            value.dirty = false;
-            value.dirty_started_at = null;
-            value.last_dirty_at = null;
-        }
+        applyPersistedPublishProgress(value, &capture, progress, true);
     }
 }
 
@@ -1830,6 +1880,87 @@ test "persisted scrollback capture rewrites after resize reflow" {
     defer loaded.deinit(testing.allocator);
 
     try expectScreenDataEqual(&expected, &loaded.primary);
+}
+
+test "persisted publish reconciliation preserves concurrent resize invalidation" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("session");
+
+    const session_path = try tmp_dir.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+    const session_dir = try testing.allocator.dupe(u8, session_path);
+
+    var terminal = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+
+    var mutex = std.Thread.Mutex{};
+    var state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &terminal,
+    };
+    var io = persistedTestTermio(testing.allocator, session_dir, terminal, &state, 1024);
+    state.terminal = &io.terminal;
+    defer {
+        if (io.persisted) |*persisted| persisted.deinit(testing.allocator);
+        io.terminal.deinit(testing.allocator);
+    }
+    try io.terminal.printString("one\ntwo\nthree\nfour");
+
+    const persisted = &io.persisted.?;
+    persisted.last_persisted_row_count = 2;
+    persisted.last_persisted_seq = 4;
+    persisted.next_seq = 8;
+    persisted.scrollback_size_bytes = 64;
+    persisted.scrollback_invalidated = true;
+    persisted.dirty = true;
+    persisted.dirty_generation = 2;
+    persisted.retry_count = 1;
+
+    var records: [0]persisted_scrollback.ScrollbackRecord = .{};
+    const capture: PersistedCapture = .{
+        .generation = 1,
+        .capture = .{},
+        .next_row_count = 3,
+        .next_tail_seq = 7,
+        .next_seq = 11,
+        .scrollback_size_bytes = 88,
+        .header_written = true,
+        .header_dims = .{ .cols = 80, .rows = 24 },
+        .metadata_hash = 42,
+        .scrollback_records = records[0..],
+    };
+    const progress: persisted_scrollback.PublishProgress = .{
+        .header_written = true,
+        .metadata_written = true,
+        .scrollback_appended = true,
+        .scrollback_tail_seq_after = 7,
+        .scrollback_size_after = 88,
+        .scrollback_record_count_after = 3,
+    };
+
+    applyPersistedPublishProgress(persisted, &capture, progress, true);
+
+    try testing.expectEqual(@as(u8, 0), persisted.retry_count);
+    try testing.expectEqual(@as(usize, 3), persisted.last_persisted_row_count);
+    try testing.expectEqual(@as(u64, 7), persisted.last_persisted_seq);
+    try testing.expectEqual(@as(u64, 11), persisted.next_seq);
+    try testing.expectEqual(@as(usize, 88), persisted.scrollback_size_bytes);
+    try testing.expect(persisted.header_written);
+    try testing.expectEqual(PersistedHeaderDims{ .cols = 80, .rows = 24 }, persisted.last_header_dims.?);
+    try testing.expectEqual(@as(u64, 42), persisted.last_metadata_hash);
+
+    try testing.expect(persisted.scrollback_invalidated);
+    try testing.expect(persisted.dirty);
+
+    var next_capture = (try io.capturePersistedScrollback()).?;
+    defer next_capture.deinit(testing.allocator);
+    try testing.expect(next_capture.capture.rewrite_scrollback);
 }
 
 test "persisted scrollback schedule waits for trailing debounce" {

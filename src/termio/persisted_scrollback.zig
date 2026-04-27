@@ -46,6 +46,17 @@ pub const Capture = struct {
     screen_alt_seq: ?u64 = null,
 };
 
+pub const PublishProgress = struct {
+    header_written: bool = false,
+    metadata_written: bool = false,
+    scrollback_appended: bool = false,
+    scrollback_tail_seq_after: u64 = 0,
+    scrollback_size_after: u64 = 0,
+    scrollback_record_count_after: usize = 0,
+    screen_written: bool = false,
+    screen_alt_written: bool = false,
+};
+
 /// Result of loading a persisted multi-file snapshot.
 pub const Loaded = struct {
     header: snapshot.Header,
@@ -78,6 +89,16 @@ pub const Error = error{
 pub fn publish(
     session_dir: []const u8,
     capture: Capture,
+) !PublishProgress {
+    var progress: PublishProgress = .{};
+    try publishWithProgress(session_dir, capture, &progress);
+    return progress;
+}
+
+pub fn publishWithProgress(
+    session_dir: []const u8,
+    capture: Capture,
+    progress: *PublishProgress,
 ) !void {
     try ensureSessionDir(session_dir);
 
@@ -86,6 +107,7 @@ pub fn publish(
 
     if (capture.header) |header| {
         try writeHeaderReplacing(&dir, header);
+        progress.header_written = true;
     }
 
     if (capture.metadata) |metadata| {
@@ -93,6 +115,32 @@ pub fn publish(
         defer buf.deinit();
         try writeMetadata(&buf.writer, metadata);
         try writeFileAtomic(&dir, "metadata", buf.writer.buffer[0..buf.writer.end]);
+        progress.metadata_written = true;
+    }
+
+    // Write screen files before advancing the append-only scrollback log. A
+    // crash can then leave the screen newer than scrollback, which restore can
+    // tolerate without dropping active rows; the inverse loses visible state.
+    if (capture.screen) |screen| {
+        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer buf.deinit();
+        try writeScreenFile(&buf.writer, capture.screen_seq, screen);
+        try writeFileAtomic(&dir, "screen", buf.writer.buffer[0..buf.writer.end]);
+        progress.screen_written = true;
+    }
+
+    if (capture.screen_alt) |screen_alt| {
+        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer buf.deinit();
+        try writeScreenFile(&buf.writer, capture.screen_alt_seq orelse capture.screen_seq, screen_alt);
+        try writeFileAtomic(&dir, "screen.alt", buf.writer.buffer[0..buf.writer.end]);
+        progress.screen_alt_written = true;
+    } else {
+        dir.deleteFile("screen.alt") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        progress.screen_alt_written = true;
     }
 
     if (capture.rewrite_scrollback) {
@@ -103,44 +151,15 @@ pub fn publish(
         defer buf.deinit();
         try writeScrollbackRecords(&buf.writer, capture.scrollback_first_seq, capture.scrollback_append);
         try writeFileAtomic(&dir, "scrollback", buf.writer.buffer[0..buf.writer.end]);
+        progress.scrollback_appended = true;
+        progress.scrollback_size_after = @intCast(buf.writer.end);
+        progress.scrollback_record_count_after = capture.scrollback_append.len;
+        progress.scrollback_tail_seq_after = if (capture.scrollback_append.len > 0)
+            capture.scrollback_first_seq +% @as(u64, @intCast(capture.scrollback_append.len)) -% 1
+        else
+            0;
     } else if (capture.scrollback_append.len > 0) {
-        var file = dir.openFile("scrollback", .{ .mode = .write_only }) catch |err| switch (err) {
-            error.FileNotFound => try dir.createFile("scrollback", .{
-                .truncate = false,
-                .mode = 0o600,
-            }),
-            else => return err,
-        };
-        defer file.close();
-        try file.seekFromEnd(0);
-
-        // Serialize records into a heap buffer, then writeAll. The buffered
-        // std.Io.Writer interface tracks its own pos starting at 0 and ignores
-        // the file's kernel seek cursor (it uses pwrite under the hood), so we
-        // write directly via the legacy file API to honor seekFromEnd.
-        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer buf.deinit();
-        try writeScrollbackRecords(&buf.writer, capture.scrollback_first_seq, capture.scrollback_append);
-        try file.writeAll(buf.writer.buffer[0..buf.writer.end]);
-    }
-
-    if (capture.screen) |screen| {
-        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer buf.deinit();
-        try writeScreenFile(&buf.writer, capture.screen_seq, screen);
-        try writeFileAtomic(&dir, "screen", buf.writer.buffer[0..buf.writer.end]);
-    }
-
-    if (capture.screen_alt) |screen_alt| {
-        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer buf.deinit();
-        try writeScreenFile(&buf.writer, capture.screen_alt_seq orelse capture.screen_seq, screen_alt);
-        try writeFileAtomic(&dir, "screen.alt", buf.writer.buffer[0..buf.writer.end]);
-    } else {
-        dir.deleteFile("screen.alt") catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+        try appendScrollbackRecordsIdempotent(&dir, capture, progress);
     }
 }
 
@@ -244,6 +263,13 @@ const ScreenFile = struct {
 
 const ScrollbackInfo = struct {
     tail_seq: u64 = 0,
+    has_records: bool = false,
+};
+
+const ScrollbackDiskState = struct {
+    size: u64 = 0,
+    tail_seq: u64 = 0,
+    record_count: usize = 0,
     has_records: bool = false,
 };
 
@@ -437,6 +463,89 @@ fn writeScrollbackRecords(
         try writer.writeAll(record.bytes);
         seq +%= 1;
     }
+}
+
+fn readScrollbackDiskState(file: *std.fs.File) !ScrollbackDiskState {
+    const stat = try file.stat();
+    try file.seekTo(0);
+
+    var state: ScrollbackDiskState = .{ .size = stat.size };
+    var pos: u64 = 0;
+    while (pos < stat.size) {
+        if (stat.size - pos < scrollback_record_prefix_size) return error.InvalidSnapshot;
+
+        var prefix: [scrollback_record_prefix_size]u8 = undefined;
+        const read_len = try file.readAll(&prefix);
+        if (read_len != scrollback_record_prefix_size) return error.InvalidSnapshot;
+
+        const seq = std.mem.readInt(u64, prefix[0..8], .big);
+        const len = std.mem.readInt(u32, prefix[8..12], .big);
+        if (state.has_records and seq <= state.tail_seq) return error.InvalidSnapshot;
+
+        pos += scrollback_record_prefix_size;
+        if (stat.size - pos < len) return error.InvalidSnapshot;
+
+        pos += len;
+        try file.seekTo(pos);
+
+        state.tail_seq = seq;
+        state.record_count += 1;
+        state.has_records = true;
+    }
+
+    return state;
+}
+
+fn appendScrollbackRecordsIdempotent(
+    dir: *std.fs.Dir,
+    capture: Capture,
+    progress: *PublishProgress,
+) !void {
+    var file = dir.openFile("scrollback", .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => try dir.createFile("scrollback", .{
+            .read = true,
+            .truncate = false,
+            .mode = 0o600,
+        }),
+        else => return err,
+    };
+    defer file.close();
+
+    const disk_state = try readScrollbackDiskState(&file);
+    var first_seq = capture.scrollback_first_seq;
+    var records = capture.scrollback_append;
+    if (disk_state.has_records and disk_state.tail_seq >= first_seq) {
+        const existing_count = disk_state.tail_seq - first_seq + 1;
+        const skip_count: usize = @intCast(@min(
+            existing_count,
+            @as(u64, @intCast(records.len)),
+        ));
+        first_seq +%= skip_count;
+        records = records[skip_count..];
+    }
+
+    progress.scrollback_appended = true;
+    progress.scrollback_tail_seq_after = disk_state.tail_seq;
+    progress.scrollback_size_after = disk_state.size;
+    progress.scrollback_record_count_after = disk_state.record_count;
+
+    if (records.len == 0) return;
+
+    try file.seekFromEnd(0);
+
+    // Serialize records into a heap buffer, then writeAll. The buffered
+    // std.Io.Writer interface tracks its own pos starting at 0 and ignores
+    // the file's kernel seek cursor (it uses pwrite under the hood), so write
+    // directly via the legacy file API to honor seekFromEnd.
+    var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer buf.deinit();
+    try writeScrollbackRecords(&buf.writer, first_seq, records);
+    try file.writeAll(buf.writer.buffer[0..buf.writer.end]);
+
+    const stat = try file.stat();
+    progress.scrollback_tail_seq_after = first_seq +% @as(u64, @intCast(records.len)) -% 1;
+    progress.scrollback_size_after = stat.size;
+    progress.scrollback_record_count_after = disk_state.record_count + records.len;
 }
 
 fn readScrollback(
@@ -745,7 +854,7 @@ test "persisted scrollback binary snapshot roundtrip" {
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
     defer testing.allocator.free(screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1735689600, .cols = 80, .rows = 24 },
         .metadata = .{ .session_id = "test-session", .pwd = "/tmp/test", .title = "test title" },
         .screen = screen,
@@ -780,7 +889,7 @@ test "load returns full screen when scrollback is empty" {
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
     defer testing.allocator.free(screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 80, .rows = 24 },
         .screen = screen,
         .screen_seq = 23,
@@ -846,12 +955,12 @@ test "persisted scrollback publish overwrites old file" {
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
     defer testing.allocator.free(screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 80, .rows = 24 },
         .screen = screen,
         .screen_seq = 23,
     });
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 2, .cols = 80, .rows = 24 },
         .metadata = .{ .title = "new title" },
         .screen = screen,
@@ -880,7 +989,7 @@ test "publish replaces header when dimensions change" {
     const first_screen = try writeScreenBytes(testing.allocator, &first_term.screens.active.*, 0, null);
     defer testing.allocator.free(first_screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .screen = first_screen,
         .screen_seq = 2,
@@ -892,7 +1001,7 @@ test "publish replaces header when dimensions change" {
     const second_screen = try writeScreenBytes(testing.allocator, &second_term.screens.active.*, 0, null);
     defer testing.allocator.free(second_screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 2, .cols = 40, .rows = 5 },
         .screen = second_screen,
         .screen_seq = 4,
@@ -925,7 +1034,7 @@ test "append-on-eviction over multiple ticks appends only new bytes" {
     const active = try writeScreenBytes(testing.allocator, screen, 1, null);
     defer testing.allocator.free(active);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .scrollback_append = &.{.{ .bytes = first }},
         .scrollback_first_seq = 0,
@@ -939,7 +1048,7 @@ test "append-on-eviction over multiple ticks appends only new bytes" {
 
     const second = try writeScreenBytes(testing.allocator, screen, 1, 1);
     defer testing.allocator.free(second);
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .scrollback_append = &.{.{ .bytes = second }},
         .scrollback_first_seq = 1,
         .screen = active,
@@ -948,6 +1057,57 @@ test "append-on-eviction over multiple ticks appends only new bytes" {
 
     const size_after_second = try fileSize(&dir, "scrollback");
     try testing.expectEqual(size_after_first + scrollback_record_prefix_size + second.len, size_after_second);
+}
+
+test "publish skips scrollback records already advanced on disk" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    var term = try terminalpkg.Terminal.init(testing.allocator, .{ .cols = 20, .rows = 3 });
+    defer term.deinit(testing.allocator);
+    try term.printString("one\ntwo\nthree\nfour");
+
+    const scrollback = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, 1);
+    defer testing.allocator.free(scrollback);
+    const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 1, null);
+    defer testing.allocator.free(screen);
+
+    // Simulate an earlier publish that appended scrollback and then failed
+    // before the active screen was replaced. The retry must not append the
+    // same seq again because readScrollback requires strictly increasing seqs.
+    _ = try publish(session_path, .{
+        .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
+        .scrollback_append = &.{.{ .bytes = scrollback }},
+        .scrollback_first_seq = 0,
+    });
+
+    var dir = try openSessionDir(session_path);
+    defer dir.close();
+    const size_after_partial = try fileSize(&dir, "scrollback");
+
+    const progress = try publish(session_path, .{
+        .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
+        .scrollback_append = &.{.{ .bytes = scrollback }},
+        .scrollback_first_seq = 0,
+        .screen = screen,
+        .screen_seq = 3,
+    });
+
+    try testing.expect(progress.scrollback_appended);
+    try testing.expectEqual(size_after_partial, progress.scrollback_size_after);
+    try testing.expectEqual(size_after_partial, try fileSize(&dir, "scrollback"));
+
+    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), loaded.scrollback_rows);
+    try testing.expectEqual(@as(usize, 4), loaded.primary.rows.len);
 }
 
 test "screen atomic-replace doesn't touch scrollback file" {
@@ -969,7 +1129,7 @@ test "screen atomic-replace doesn't touch scrollback file" {
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 1, null);
     defer testing.allocator.free(screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .scrollback_append = &.{.{ .bytes = scrollback }},
         .scrollback_first_seq = 0,
@@ -981,8 +1141,8 @@ test "screen atomic-replace doesn't touch scrollback file" {
     defer dir.close();
     const before = try dir.statFile("scrollback");
 
-    try publish(session_path, .{ .screen = screen, .screen_seq = 4 });
-    try publish(session_path, .{ .screen = screen, .screen_seq = 5 });
+    _ = try publish(session_path, .{ .screen = screen, .screen_seq = 4 });
+    _ = try publish(session_path, .{ .screen = screen, .screen_seq = 5 });
 
     const after = try dir.statFile("scrollback");
     try testing.expectEqual(before.size, after.size);
@@ -1008,7 +1168,7 @@ test "seq-number reconciliation drops duplicate screen rows during load" {
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
     defer testing.allocator.free(screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .scrollback_append = &.{.{ .bytes = row0 }},
         .scrollback_first_seq = 0,
@@ -1037,7 +1197,7 @@ test "load on missing scrollback file returns empty scrollback" {
 
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
     defer testing.allocator.free(screen);
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .screen = screen,
         .screen_seq = 2,
@@ -1064,7 +1224,7 @@ test "load rejects mismatched seq monotonicity" {
 
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
     defer testing.allocator.free(screen);
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .screen = screen,
         .screen_seq = 2,
@@ -1095,7 +1255,7 @@ test "publish creates session dir tree if missing" {
     const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
     defer testing.allocator.free(screen);
 
-    try publish(session_path, .{
+    _ = try publish(session_path, .{
         .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
         .screen = screen,
         .screen_seq = 2,
