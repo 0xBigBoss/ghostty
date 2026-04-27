@@ -384,8 +384,8 @@ fn persistedScrollbackGateState(
         .dirty = persisted.dirty,
         .header_written = persisted.header_written,
         .first_write_age_ms = instantAgeMs(now, persisted.created_at),
-        .dirty_age_ms = @intCast(now.since(dirty_started_at) / std.time.ns_per_ms),
-        .idle_ms = @intCast(now.since(last_dirty_at) / std.time.ns_per_ms),
+        .dirty_age_ms = @intCast(sinceSafeNs(now, dirty_started_at) / std.time.ns_per_ms),
+        .idle_ms = @intCast(sinceSafeNs(now, last_dirty_at) / std.time.ns_per_ms),
         .screen_interval_ms = persisted.screen_interval_ms,
     };
 }
@@ -415,9 +415,19 @@ fn instantSubtractNs(instant: std.time.Instant, ns: u64) std.time.Instant {
     return result;
 }
 
+fn sinceSafeNs(later: std.time.Instant, earlier: std.time.Instant) u64 {
+    // Instant.since assumes monotonic ordering and panics on unsigned
+    // underflow. Persisted scrollback timestamps can cross thread
+    // boundaries, so treat a later-observed "earlier" instant as zero age.
+    return switch (later.order(earlier)) {
+        .lt => 0,
+        .eq, .gt => later.since(earlier),
+    };
+}
+
 fn instantAgeMs(now: std.time.Instant, then: ?std.time.Instant) ?u64 {
     const start = then orelse return null;
-    return @intCast(now.since(start) / std.time.ns_per_ms);
+    return @intCast(sinceSafeNs(now, start) / std.time.ns_per_ms);
 }
 
 fn requestPersistedScrollbackLifecycleFlushLocked(
@@ -1189,7 +1199,7 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // use a timer under the covers
     if (std.time.Instant.now()) |now| cursor_reset: {
         if (self.last_cursor_reset) |last| {
-            if (now.since(last) <= (500 * std.time.ns_per_ms)) {
+            if (sinceSafeNs(now, last) <= (500 * std.time.ns_per_ms)) {
                 break :cursor_reset;
             }
         }
@@ -2659,10 +2669,32 @@ test "persisted scrollback lifecycle request flushes dirty state immediately" {
         PersistedScheduleDecision.flush,
         persistedScrollbackScheduleDecision(.{
             .dirty = persisted.dirty,
-            .dirty_age_ms = @intCast(now.since(persisted.dirty_started_at.?) / std.time.ns_per_ms),
-            .idle_ms = @intCast(now.since(persisted.last_dirty_at.?) / std.time.ns_per_ms),
+            .dirty_age_ms = @intCast(sinceSafeNs(now, persisted.dirty_started_at.?) / std.time.ns_per_ms),
+            .idle_ms = @intCast(sinceSafeNs(now, persisted.last_dirty_at.?) / std.time.ns_per_ms),
         }),
     );
+}
+
+test "persisted_scrollback gate clamps out of order instants" {
+    const testing = std.testing;
+
+    const captured = try std.time.Instant.now();
+    const now = instantSubtractNs(captured, std.time.ns_per_ms);
+    const persisted: PersistedState = .{
+        .session_dir = undefined,
+        .session_id = null,
+        .limit = 1024,
+        .dirty = true,
+        .created_at = captured,
+        .dirty_started_at = captured,
+        .last_dirty_at = captured,
+    };
+
+    const state = persistedScrollbackGateState(&persisted, now);
+
+    try testing.expectEqual(@as(u64, 0), state.dirty_age_ms);
+    try testing.expectEqual(@as(u64, 0), state.idle_ms);
+    try testing.expectEqual(@as(?u64, 0), state.first_write_age_ms);
 }
 
 test "persisted scrollback retry delay backs off and caps" {
