@@ -1452,6 +1452,36 @@ fn persistedSizeFromProgress(size: u64) usize {
     return std.math.cast(usize, size) orelse std.math.maxInt(usize);
 }
 
+fn persistedCaptureScreenComponentsWritten(
+    capture: *const PersistedCapture,
+    progress: persisted_scrollback.PublishProgress,
+) bool {
+    if (capture.capture.screen != null and !progress.screen_written) return false;
+    if (capture.capture.screen_alt != null and !progress.screen_alt_written) return false;
+    return true;
+}
+
+fn applyPersistedPartialPublishProgress(
+    value: *PersistedState,
+    capture: *const PersistedCapture,
+    progress: persisted_scrollback.PublishProgress,
+) void {
+    if (progress.header_written) {
+        value.header_written = true;
+        if (capture.header_dims) |dims| value.last_header_dims = dims;
+    }
+    if (progress.metadata_written) value.last_metadata_hash = capture.metadata_hash;
+    if (progress.scrollback_appended) {
+        value.last_persisted_row_count = capture.next_row_count;
+        value.last_persisted_seq = progress.scrollback_tail_seq_after;
+        value.next_seq = if (progress.scrollback_record_count_after > 0)
+            progress.scrollback_tail_seq_after +% 1
+        else
+            0;
+        value.scrollback_size_bytes = persistedSizeFromProgress(progress.scrollback_size_after);
+    }
+}
+
 fn applyPersistedPublishProgress(
     value: *PersistedState,
     capture: *const PersistedCapture,
@@ -1460,6 +1490,11 @@ fn applyPersistedPublishProgress(
 ) void {
     if (publish_succeeded) {
         value.retry_count = 0;
+        if (!persistedCaptureScreenComponentsWritten(capture, progress)) {
+            applyPersistedPartialPublishProgress(value, capture, progress);
+            return;
+        }
+
         value.last_persisted_row_count = capture.next_row_count;
         value.last_persisted_seq = if (progress.scrollback_appended)
             progress.scrollback_tail_seq_after
@@ -1483,20 +1518,7 @@ fn applyPersistedPublishProgress(
         return;
     }
 
-    if (progress.header_written) {
-        value.header_written = true;
-        if (capture.header_dims) |dims| value.last_header_dims = dims;
-    }
-    if (progress.metadata_written) value.last_metadata_hash = capture.metadata_hash;
-    if (progress.scrollback_appended) {
-        value.last_persisted_row_count = capture.next_row_count;
-        value.last_persisted_seq = progress.scrollback_tail_seq_after;
-        value.next_seq = if (progress.scrollback_record_count_after > 0)
-            progress.scrollback_tail_seq_after +% 1
-        else
-            0;
-        value.scrollback_size_bytes = persistedSizeFromProgress(progress.scrollback_size_after);
-    }
+    applyPersistedPartialPublishProgress(value, capture, progress);
 }
 
 pub fn flushPersistedScrollback(self: *Termio) !void {
@@ -2059,6 +2081,52 @@ test "persisted publish reconciliation preserves concurrent resize invalidation"
     var next_capture = (try io.capturePersistedScrollback()).?;
     defer next_capture.deinit(testing.allocator);
     try testing.expect(next_capture.capture.rewrite_scrollback);
+}
+
+test "persisted publish progress keeps dirty when screen is skipped" {
+    const testing = std.testing;
+
+    var persisted: PersistedState = .{
+        .session_dir = undefined,
+        .session_id = null,
+        .limit = 1024,
+        .last_persisted_row_count = 2,
+        .last_persisted_seq = 4,
+        .next_seq = 8,
+        .scrollback_size_bytes = 64,
+        .dirty = true,
+        .dirty_generation = 3,
+    };
+    var records: [0]persisted_scrollback.ScrollbackRecord = .{};
+    const capture: PersistedCapture = .{
+        .generation = 3,
+        .capture = .{
+            .screen = "oversized-screen",
+            .screen_seq = 12,
+        },
+        .next_row_count = 3,
+        .next_tail_seq = 7,
+        .next_seq = 13,
+        .scrollback_size_bytes = 88,
+        .header_written = true,
+        .metadata_hash = 42,
+        .scrollback_records = records[0..],
+    };
+    const progress: persisted_scrollback.PublishProgress = .{
+        .scrollback_appended = true,
+        .scrollback_tail_seq_after = 7,
+        .scrollback_size_after = 88,
+        .scrollback_record_count_after = 3,
+        .screen_written = false,
+        .screen_alt_written = true,
+    };
+
+    applyPersistedPublishProgress(&persisted, &capture, progress, true);
+
+    try testing.expectEqual(@as(u64, 7), persisted.last_persisted_seq);
+    try testing.expectEqual(@as(u64, 8), persisted.next_seq);
+    try testing.expectEqual(@as(usize, 88), persisted.scrollback_size_bytes);
+    try testing.expect(persisted.dirty);
 }
 
 test "persisted scrollback schedule waits for trailing debounce" {

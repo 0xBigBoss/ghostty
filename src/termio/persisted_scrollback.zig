@@ -73,6 +73,21 @@ pub const PublishProgress = struct {
     screen_alt_written: bool = false,
 };
 
+fn screenFileSerializedSize(screen: []const u8) usize {
+    return std.math.add(usize, screen_prefix_size, screen.len) catch std.math.maxInt(usize);
+}
+
+fn shouldSkipOversizedScreenFile(session_dir: []const u8, screen: []const u8) bool {
+    const size = screenFileSerializedSize(screen);
+    if (size <= screen_file_max_size) return false;
+
+    log.warn(
+        "persisted scrollback: skipping oversized screen file size={} cap={} session_id={s}",
+        .{ size, screen_file_max_size, std.fs.path.basename(session_dir) },
+    );
+    return true;
+}
+
 /// Result of loading a persisted multi-file snapshot.
 pub const Loaded = struct {
     header: snapshot.Header,
@@ -138,19 +153,23 @@ pub fn publishWithProgress(
     // crash can then leave the screen newer than scrollback, which restore can
     // tolerate without dropping active rows; the inverse loses visible state.
     if (capture.screen) |screen| {
-        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer buf.deinit();
-        try writeScreenFile(&buf.writer, capture.screen_seq, screen);
-        try writeFileAtomic(&dir, "screen", buf.writer.buffer[0..buf.writer.end]);
-        progress.screen_written = true;
+        if (!shouldSkipOversizedScreenFile(session_dir, screen)) {
+            var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+            defer buf.deinit();
+            try writeScreenFile(&buf.writer, capture.screen_seq, screen);
+            try writeFileAtomic(&dir, "screen", buf.writer.buffer[0..buf.writer.end]);
+            progress.screen_written = true;
+        }
     }
 
     if (capture.screen_alt) |screen_alt| {
-        var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer buf.deinit();
-        try writeScreenFile(&buf.writer, capture.screen_alt_seq orelse capture.screen_seq, screen_alt);
-        try writeFileAtomic(&dir, "screen.alt", buf.writer.buffer[0..buf.writer.end]);
-        progress.screen_alt_written = true;
+        if (!shouldSkipOversizedScreenFile(session_dir, screen_alt)) {
+            var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+            defer buf.deinit();
+            try writeScreenFile(&buf.writer, capture.screen_alt_seq orelse capture.screen_seq, screen_alt);
+            try writeFileAtomic(&dir, "screen.alt", buf.writer.buffer[0..buf.writer.end]);
+            progress.screen_alt_written = true;
+        }
     } else {
         dir.deleteFile("screen.alt") catch |err| switch (err) {
             error.FileNotFound => {},
@@ -1165,6 +1184,55 @@ test "screen atomic-replace doesn't touch scrollback file" {
     const after = try dir.statFile("scrollback");
     try testing.expectEqual(before.size, after.size);
     try testing.expectEqual(before.mtime, after.mtime);
+}
+
+test "publish skips oversized screen files and keeps existing files" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    _ = try publish(session_path, .{
+        .screen = "previous-screen",
+        .screen_seq = 1,
+        .screen_alt = "previous-alt-screen",
+        .screen_alt_seq = 2,
+    });
+
+    const before_screen = try tmp.dir.readFileAlloc(testing.allocator, "session/screen", screen_file_max_size);
+    defer testing.allocator.free(before_screen);
+    const before_alt = try tmp.dir.readFileAlloc(testing.allocator, "session/screen.alt", screen_file_max_size);
+    defer testing.allocator.free(before_alt);
+
+    const oversized = try testing.allocator.alloc(u8, screen_file_max_size + 1);
+    defer testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+
+    const progress = try publish(session_path, .{
+        .scrollback_append = &.{.{ .bytes = "scrollback-row" }},
+        .scrollback_first_seq = 0,
+        .screen = oversized,
+        .screen_seq = 3,
+        .screen_alt = oversized,
+        .screen_alt_seq = 4,
+    });
+
+    try testing.expect(!progress.screen_written);
+    try testing.expect(!progress.screen_alt_written);
+    try testing.expect(progress.scrollback_appended);
+
+    const after_screen = try tmp.dir.readFileAlloc(testing.allocator, "session/screen", screen_file_max_size);
+    defer testing.allocator.free(after_screen);
+    const after_alt = try tmp.dir.readFileAlloc(testing.allocator, "session/screen.alt", screen_file_max_size);
+    defer testing.allocator.free(after_alt);
+
+    try testing.expectEqualSlices(u8, before_screen, after_screen);
+    try testing.expectEqualSlices(u8, before_alt, after_alt);
+    try tmp.dir.access("session/scrollback", .{});
 }
 
 test "seq-number reconciliation drops duplicate screen rows during load" {
