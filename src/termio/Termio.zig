@@ -213,7 +213,7 @@ const PersistedState = struct {
             .{ session_dir, limit, sid },
         );
 
-        return .{
+        const state: PersistedState = .{
             .session_dir = session_dir,
             .session_id = try alloc.dupe(u8, sid),
             .limit = limit,
@@ -228,9 +228,12 @@ const PersistedState = struct {
             } else null,
             .created_at = std.time.Instant.now() catch null,
         };
+        persisted_scrollback.registerActiveSession();
+        return state;
     }
 
     fn deinit(self: *PersistedState, alloc: Allocator) void {
+        persisted_scrollback.unregisterActiveSession();
         alloc.free(self.session_dir);
         if (self.session_id) |value| alloc.free(value);
         self.* = undefined;
@@ -1853,6 +1856,7 @@ fn persistedTestTermio(
     renderer_state: *renderer.State,
     limit: usize,
 ) Termio {
+    persisted_scrollback.registerActiveSession();
     return .{
         .alloc = alloc,
         .terminal = terminal,

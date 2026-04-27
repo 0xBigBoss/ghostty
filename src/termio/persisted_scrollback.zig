@@ -20,9 +20,13 @@ const scrollback_record_prefix_size: usize = 12;
 pub const stale_session_retention_seconds: i64 = 7 * 24 * 60 * 60;
 pub const stale_session_cleanup_interval_ms: u64 = 60 * 60 * 1000;
 const stale_session_close_cleanup_min_interval_seconds: i64 = 5 * 60;
+const write_telemetry_report_interval_seconds: i64 = 60;
 
 var stale_session_cleanup_running: std.atomic.Value(bool) = .init(false);
 var stale_session_close_cleanup_last_timestamp: std.atomic.Value(i64) = .init(0);
+var write_telemetry_bytes: std.atomic.Value(u64) = .init(0);
+var write_telemetry_last_report_timestamp: std.atomic.Value(i64) = .init(0);
+var write_telemetry_active_sessions: std.atomic.Value(usize) = .init(0);
 
 /// Screen state is structurally bounded by terminal dimensions, not by the
 /// user-facing scrollback log cap. The cap is a defense against damaged or
@@ -89,6 +93,62 @@ pub const PublishProgress = struct {
     screen_written: bool = false,
     screen_alt_written: bool = false,
 };
+
+pub fn registerActiveSession() void {
+    _ = write_telemetry_active_sessions.fetchAdd(1, .monotonic);
+}
+
+pub fn unregisterActiveSession() void {
+    const previous = write_telemetry_active_sessions.fetchSub(1, .monotonic);
+    std.debug.assert(previous > 0);
+}
+
+fn recordWriteTelemetry(bytes: usize) void {
+    if (bytes == 0) return;
+    _ = write_telemetry_bytes.fetchAdd(@intCast(bytes), .monotonic);
+    // Keep telemetry dependency-free by reporting from the write path instead
+    // of adding a process-wide timer just for diagnostics.
+    maybeReportWriteTelemetry(std.time.timestamp());
+}
+
+fn maybeReportWriteTelemetry(now: i64) void {
+    while (true) {
+        const last = write_telemetry_last_report_timestamp.load(.monotonic);
+        if (last == 0) {
+            if (write_telemetry_last_report_timestamp.cmpxchgWeak(
+                0,
+                now,
+                .monotonic,
+                .monotonic,
+            )) |_| continue;
+            return;
+        }
+        if (now - last < write_telemetry_report_interval_seconds) return;
+        if (write_telemetry_last_report_timestamp.cmpxchgWeak(
+            last,
+            now,
+            .monotonic,
+            .monotonic,
+        )) |_| continue;
+
+        const bytes = write_telemetry_bytes.swap(0, .acq_rel);
+        log.info(
+            "write rate total_bytes_per_minute={} sessions_active={}",
+            .{ bytes, write_telemetry_active_sessions.load(.monotonic) },
+        );
+        return;
+    }
+}
+
+fn resetWriteTelemetryForTest() void {
+    write_telemetry_bytes.store(0, .monotonic);
+    write_telemetry_last_report_timestamp.store(0, .monotonic);
+    write_telemetry_active_sessions.store(0, .monotonic);
+}
+
+fn writeTelemetryBytesForTest() u64 {
+    return write_telemetry_bytes.load(.monotonic);
+}
 
 fn screenFileSerializedSize(screen: []const u8) usize {
     return std.math.add(usize, screen_prefix_size, screen.len) catch std.math.maxInt(usize);
@@ -159,7 +219,7 @@ pub fn publishWithProgress(
     scrollback_capture.header = publish_header;
 
     if (publish_header) |header| {
-        try writeHeaderReplacing(&dir, header);
+        recordWriteTelemetry(try writeHeaderReplacing(&dir, header));
         progress.header_written = true;
     }
 
@@ -167,7 +227,7 @@ pub fn publishWithProgress(
         var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer buf.deinit();
         try writeMetadata(&buf.writer, metadata);
-        try writeFileAtomic(&dir, "metadata", buf.writer.buffer[0..buf.writer.end]);
+        recordWriteTelemetry(try writeFileAtomic(&dir, "metadata", buf.writer.buffer[0..buf.writer.end]));
         progress.metadata_written = true;
     }
 
@@ -179,7 +239,7 @@ pub fn publishWithProgress(
             var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
             defer buf.deinit();
             try writeScreenFile(&buf.writer, capture.screen_seq, screen);
-            try writeFileAtomic(&dir, "screen", buf.writer.buffer[0..buf.writer.end]);
+            recordWriteTelemetry(try writeFileAtomic(&dir, "screen", buf.writer.buffer[0..buf.writer.end]));
             progress.screen_written = true;
         }
     }
@@ -189,7 +249,7 @@ pub fn publishWithProgress(
             var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
             defer buf.deinit();
             try writeScreenFile(&buf.writer, capture.screen_alt_seq orelse capture.screen_seq, screen_alt);
-            try writeFileAtomic(&dir, "screen.alt", buf.writer.buffer[0..buf.writer.end]);
+            recordWriteTelemetry(try writeFileAtomic(&dir, "screen.alt", buf.writer.buffer[0..buf.writer.end]));
             progress.screen_alt_written = true;
         }
     } else {
@@ -214,7 +274,7 @@ pub fn publishWithProgress(
             buf.writer.buffer[0..buf.writer.end],
         );
         defer std.heap.page_allocator.free(compressed);
-        try writeFileAtomic(&dir, "scrollback", compressed);
+        recordWriteTelemetry(try writeFileAtomic(&dir, "scrollback", compressed));
         progress.scrollback_appended = true;
         progress.scrollback_size_after = @intCast(compressed.len);
         progress.scrollback_record_count_after = capture.scrollback_append.len;
@@ -456,7 +516,7 @@ fn headerBytes(header: Header) [header_size]u8 {
     return data;
 }
 
-fn writeHeaderReplacing(dir: *std.fs.Dir, header: Header) !void {
+fn writeHeaderReplacing(dir: *std.fs.Dir, header: Header) !usize {
     const data = headerBytes(header);
 
     var file = dir.openFile("header", .{}) catch {
@@ -473,9 +533,9 @@ fn writeHeaderReplacing(dir: *std.fs.Dir, header: Header) !void {
     const read_len = file.readAll(&existing) catch {
         return try writeFileAtomic(dir, "header", &data);
     };
-    if (read_len == header_size and std.mem.eql(u8, &existing, &data)) return;
+    if (read_len == header_size and std.mem.eql(u8, &existing, &data)) return 0;
 
-    try writeFileAtomic(dir, "header", &data);
+    return try writeFileAtomic(dir, "header", &data);
 }
 
 fn readHeader(data: []const u8) Error!Header {
@@ -621,12 +681,13 @@ fn appendCompressedScrollback(
     file: *std.fs.File,
     header: Header,
     data: []const u8,
-) !void {
+) !usize {
     const compressed = try compressScrollbackAlloc(alloc, header, data);
     defer alloc.free(compressed);
 
     try file.seekFromEnd(0);
     try file.writeAll(compressed);
+    return compressed.len;
 }
 
 fn decompressGzipMembersAlloc(alloc: Allocator, data: []const u8) (Allocator.Error || Error)![]u8 {
@@ -825,12 +886,12 @@ fn appendScrollbackRecordsIdempotent(
     var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer buf.deinit();
     try writeScrollbackRecords(&buf.writer, first_seq, records);
-    try appendCompressedScrollback(
+    recordWriteTelemetry(try appendCompressedScrollback(
         std.heap.page_allocator,
         &file,
         header,
         buf.writer.buffer[0..buf.writer.end],
-    );
+    ));
 
     const stat = try file.stat();
     progress.scrollback_tail_seq_after = first_seq +% @as(u64, @intCast(records.len)) -% 1;
@@ -932,7 +993,7 @@ fn writeFileAtomic(
     dir: *std.fs.Dir,
     path: []const u8,
     data: []const u8,
-) !void {
+) !usize {
     var temp_name_buf: [std.fs.max_path_bytes]u8 = undefined;
     const temp_name = try std.fmt.bufPrint(&temp_name_buf, "{s}.tmp", .{path});
 
@@ -944,6 +1005,7 @@ fn writeFileAtomic(
 
     try file.writeAll(data);
     try dir.rename(temp_name, path);
+    return data.len;
 }
 
 fn openSessionDir(path: []const u8) !std.fs.Dir {
@@ -1334,7 +1396,7 @@ test "persisted scrollback load accepts uncompressed scrollback log" {
 
     var dir = try std.fs.openDirAbsolute(session_path, .{});
     defer dir.close();
-    try writeHeaderReplacing(&dir, .{
+    _ = try writeHeaderReplacing(&dir, .{
         .timestamp = 11,
         .cols = 16,
         .rows = 3,
@@ -1343,11 +1405,11 @@ test "persisted scrollback load accepts uncompressed scrollback log" {
     var scrollback_buf: std.Io.Writer.Allocating = .init(testing.allocator);
     defer scrollback_buf.deinit();
     try writeScrollbackRecords(&scrollback_buf.writer, 0, &.{.{ .bytes = scrollback }});
-    try writeFileAtomic(&dir, "scrollback", scrollback_buf.writer.buffer[0..scrollback_buf.writer.end]);
+    _ = try writeFileAtomic(&dir, "scrollback", scrollback_buf.writer.buffer[0..scrollback_buf.writer.end]);
     var screen_buf: std.Io.Writer.Allocating = .init(testing.allocator);
     defer screen_buf.deinit();
     try writeScreenFile(&screen_buf.writer, 100, screen);
-    try writeFileAtomic(&dir, "screen", screen_buf.writer.buffer[0..screen_buf.writer.end]);
+    _ = try writeFileAtomic(&dir, "screen", screen_buf.writer.buffer[0..screen_buf.writer.end]);
 
     var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
@@ -1510,6 +1572,38 @@ test "persisted scrollback publish overwrites old file" {
 
     try testing.expectEqual(@as(i64, 2), loaded.header.timestamp);
     try testing.expectEqualStrings("new title", loaded.title.?);
+}
+
+test "persisted scrollback publish records bytes written for telemetry" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    resetWriteTelemetryForTest();
+    defer resetWriteTelemetryForTest();
+
+    var term = try terminalpkg.Terminal.init(testing.allocator, .{ .cols = 20, .rows = 3 });
+    defer term.deinit(testing.allocator);
+
+    const screen = try writeScreenBytes(testing.allocator, &term.screens.active.*, 0, null);
+    defer testing.allocator.free(screen);
+
+    _ = try publish(session_path, .{
+        .header = .{ .timestamp = 1, .cols = 20, .rows = 3 },
+        .screen = screen,
+        .screen_seq = 1,
+    });
+    _ = try publish(session_path, .{ .screen = screen, .screen_seq = 2 });
+
+    try testing.expectEqual(
+        @as(u64, header_size + (screen_prefix_size + screen.len) * 2),
+        writeTelemetryBytesForTest(),
+    );
 }
 
 test "publish replaces header when dimensions change" {
