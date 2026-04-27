@@ -1716,6 +1716,15 @@ const PersistedScrollbackFlushThread = struct {
     }
 };
 
+/// Persist the current terminal state to disk.
+///
+/// **Durability contract:** persistence is best-effort. The active screen
+/// is rewritten atomically every `scrollback-persist-screen-interval-ms`
+/// (default 5000ms) when there's pending dirty state. The scrollback log
+/// is appended at row eviction. The most recent
+/// `scrollback-persist-screen-interval-ms` of activity may be lost in a
+/// crash. Final flushes on session close, focus loss, and SIGTERM
+/// (phase-3) reduce the window in practice.
 pub fn flushPersistedScrollback(self: *Termio) !void {
     if (comptime builtin.target.os.tag == .macos) {
         var ctx: PersistedScrollbackFlushThread = .{ .io = self };

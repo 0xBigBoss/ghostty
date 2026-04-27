@@ -8,6 +8,23 @@ const posix = std.posix;
 
 const log = std.log.scoped(.persisted_scrollback);
 
+// FUTURE:
+// - Search across persisted scrollback (full-text or regex over the on-disk
+//   log) — not in v1; would need a separate index file.
+// - Asymmetric in-memory vs on-disk scrollback limits — the in-memory limit
+//   is `scrollback-limit`; the persisted log limit is `scrollback-snapshot-limit`.
+//   Today the persisted log effectively follows the in-memory size; making
+//   them independent (e.g., persist 10× more than is kept in memory) requires
+//   a separate retention strategy on the log.
+// - Cross-session deduplication — if the user runs the same shell pipeline
+//   in many tabs, identical scrollback content is duplicated across sessions.
+//   Content-hash dedup with a shared chunk store is possible but adds significant
+//   complexity for a marginal disk-usage win.
+// - Total-size disk cap (e.g., `--max-total-mb`). DELIBERATELY NOT IMPLEMENTED.
+//   Silent eviction by total disk size is a footgun (deletes data users might
+//   still want). Retention-by-age is the more honest contract: a user knows
+//   when their data will go away.
+
 const magic_header = "GSPH";
 const magic_metadata = "GSPM";
 const magic_screen = "GSPS";
@@ -202,6 +219,12 @@ pub const Error = error{
 };
 
 /// Write component snapshot data to the session directory.
+///
+/// Each session directory is split by component: `header` stores fixed
+/// format/version/dimensions/compression metadata, `metadata` stores optional
+/// session identity and context, `scrollback` stores the append-only
+/// row-eviction log, and `screen` / `screen.alt` store atomically rewritten
+/// active and alternate screen snapshots.
 pub fn publish(
     session_dir: []const u8,
     capture: Capture,
