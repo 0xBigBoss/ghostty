@@ -21,6 +21,9 @@ const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const persisted_scrollback = @import("../termio/persisted_scrollback.zig");
+const globalpkg = @import("../global.zig");
+const xev = globalpkg.xev;
+const global_state = &globalpkg.state;
 
 const log = std.log.scoped(.embedded_window);
 
@@ -120,6 +123,12 @@ pub const App = struct {
     core_app: *CoreApp,
     opts: Options,
     keymap: input.Keymap,
+    stale_session_cleanup_loop: xev.Loop,
+    stale_session_cleanup_stop: xev.Async,
+    stale_session_cleanup_stop_c: xev.Completion = .{},
+    stale_session_cleanup_timer: xev.Timer,
+    stale_session_cleanup_timer_c: xev.Completion = .{},
+    stale_session_cleanup_thread: std.Thread,
 
     /// The configuration for the app. This is owned by this structure.
     config: Config,
@@ -138,17 +147,113 @@ pub const App = struct {
         var keymap = try input.Keymap.init();
         errdefer keymap.deinit();
 
+        var stale_session_cleanup_loop = try xev.Loop.init(.{});
+        errdefer stale_session_cleanup_loop.deinit();
+
+        var stale_session_cleanup_stop = try xev.Async.init();
+        errdefer stale_session_cleanup_stop.deinit();
+
+        var stale_session_cleanup_timer = try xev.Timer.init();
+        errdefer stale_session_cleanup_timer.deinit();
+
         self.* = .{
             .core_app = core_app,
             .config = config_clone,
             .opts = opts,
             .keymap = keymap,
+            .stale_session_cleanup_loop = stale_session_cleanup_loop,
+            .stale_session_cleanup_stop = stale_session_cleanup_stop,
+            .stale_session_cleanup_timer = stale_session_cleanup_timer,
+            .stale_session_cleanup_thread = undefined,
         };
+
+        self.stale_session_cleanup_thread = try std.Thread.spawn(
+            .{},
+            staleSessionCleanupThreadMain,
+            .{self},
+        );
+        self.stale_session_cleanup_thread.setName("session-gc") catch {};
     }
 
     pub fn terminate(self: *App) void {
+        self.stale_session_cleanup_stop.notify() catch |err| {
+            log.warn("error notifying stale session cleanup thread to stop err={}", .{err});
+        };
+        self.stale_session_cleanup_thread.join();
+        self.stale_session_cleanup_timer.deinit();
+        self.stale_session_cleanup_stop.deinit();
+        self.stale_session_cleanup_loop.deinit();
         self.keymap.deinit();
         self.config.deinit();
+    }
+
+    fn staleSessionCleanupThreadMain(self: *App) void {
+        self.stale_session_cleanup_stop.wait(
+            &self.stale_session_cleanup_loop,
+            &self.stale_session_cleanup_stop_c,
+            App,
+            self,
+            staleSessionCleanupStopCallback,
+        );
+        self.stale_session_cleanup_timer.run(
+            &self.stale_session_cleanup_loop,
+            &self.stale_session_cleanup_timer_c,
+            persisted_scrollback.stale_session_cleanup_interval_ms,
+            App,
+            self,
+            staleSessionCleanupTimerCallback,
+        );
+
+        self.stale_session_cleanup_loop.run(.until_done) catch |err| {
+            log.warn("stale session cleanup loop failed err={}", .{err});
+        };
+    }
+
+    fn staleSessionCleanupStopCallback(
+        self_: ?*App,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        _ = r catch |err| {
+            log.warn("error during stale session cleanup stop err={}", .{err});
+            return .disarm;
+        };
+        _ = self_ orelse return .disarm;
+
+        loop.stop();
+        return .disarm;
+    }
+
+    fn staleSessionCleanupTimerCallback(
+        self_: ?*App,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        r: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = r catch |err| switch (err) {
+            error.Canceled => return .disarm,
+            else => {
+                log.warn("error during stale session cleanup timer err={}", .{err});
+                return .disarm;
+            },
+        };
+
+        const self = self_ orelse return .disarm;
+        log.debug("stale session cleanup reason=hourly", .{});
+        _ = persisted_scrollback.cleanupStaleSessionsGuarded(global_state.alloc) catch |err| {
+            log.warn("stale session cleanup failed reason=hourly err={}", .{err});
+        };
+
+        self.stale_session_cleanup_timer.run(
+            loop,
+            completion,
+            persisted_scrollback.stale_session_cleanup_interval_ms,
+            App,
+            self,
+            staleSessionCleanupTimerCallback,
+        );
+        return .disarm;
     }
 
     /// Returns true if there are any global keybinds in the configuration.
@@ -1446,13 +1551,10 @@ pub const CAPI = struct {
         try app.init(core_app, config, opts.*);
         errdefer app.terminate();
 
-        // Clean up stale persisted scrollback sessions on startup.
-        // Sessions whose manifest hasn't been updated within the retention
-        // period are deleted. Active sessions stay fresh via the 300ms
-        // save timer. 7-day retention.
-        const retention: i64 = 7 * 24 * 60 * 60;
-        persisted_scrollback.cleanupStaleSessions(global.alloc, retention) catch |err| {
-            log.warn("stale session cleanup failed err={}", .{err});
+        // Startup cleanup handles stale sessions left behind by prior Ghostty
+        // runs before newly restored sessions begin refreshing their state.
+        _ = persisted_scrollback.cleanupStaleSessionsGuarded(global_state.alloc) catch |err| {
+            log.warn("stale session cleanup failed reason=startup err={}", .{err});
         };
 
         return app;

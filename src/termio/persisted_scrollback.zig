@@ -16,6 +16,13 @@ const header_size: usize = 22;
 const screen_prefix_size: usize = 14;
 const scrollback_record_prefix_size: usize = 12;
 
+pub const stale_session_retention_seconds: i64 = 7 * 24 * 60 * 60;
+pub const stale_session_cleanup_interval_ms: u64 = 60 * 60 * 1000;
+const stale_session_close_cleanup_min_interval_seconds: i64 = 5 * 60;
+
+var stale_session_cleanup_running: std.atomic.Value(bool) = .init(false);
+var stale_session_close_cleanup_last_timestamp: std.atomic.Value(i64) = .init(0);
+
 /// Screen state is structurally bounded by terminal dimensions, not by the
 /// user-facing scrollback log cap. The cap is a defense against damaged or
 /// hostile session dirs, so it must comfortably exceed any plausible visible
@@ -801,6 +808,36 @@ pub fn cleanupStaleSessions(alloc: Allocator, retention_seconds: i64) !void {
     }
 }
 
+/// Run stale session cleanup if another cleanup pass is not already active.
+/// Concurrent cleanup is idempotent but wasteful because each pass scans the
+/// full persisted session directory tree.
+pub fn cleanupStaleSessionsGuarded(alloc: Allocator) !bool {
+    if (stale_session_cleanup_running.swap(true, .acq_rel)) return false;
+    defer stale_session_cleanup_running.store(false, .release);
+
+    try cleanupStaleSessions(alloc, stale_session_retention_seconds);
+    return true;
+}
+
+/// Run stale session cleanup from the session-close hook, rate-limited so
+/// closing many tabs cannot force repeated full directory sweeps.
+pub fn cleanupStaleSessionsOnClose(alloc: Allocator) !bool {
+    const now = std.time.timestamp();
+    while (true) {
+        const last = stale_session_close_cleanup_last_timestamp.load(.monotonic);
+        if (last != 0 and now - last < stale_session_close_cleanup_min_interval_seconds) return false;
+        if (stale_session_close_cleanup_last_timestamp.cmpxchgWeak(
+            last,
+            now,
+            .monotonic,
+            .monotonic,
+        )) |_| continue;
+        break;
+    }
+
+    return try cleanupStaleSessionsGuarded(alloc);
+}
+
 fn writeScreenBytes(
     alloc: Allocator,
     screen: *const terminalpkg.Screen,
@@ -865,6 +902,56 @@ test "cleanupStaleSessions deletes expired and keeps fresh" {
     try testing.expectError(error.FileNotFound, tmp.dir.access("ghostty/session/stale-uuid/screen", .{}));
     try tmp.dir.access("ghostty/session/fresh-uuid/screen", .{});
     try testing.expectError(error.FileNotFound, tmp.dir.access("ghostty/session/legacy-uuid/manifest", .{}));
+}
+
+test "cleanupStaleSessionsOnClose deletes expired sessions and rate limits repeated closes" {
+    const testing = std.testing;
+
+    stale_session_cleanup_running.store(false, .monotonic);
+    stale_session_close_cleanup_last_timestamp.store(0, .monotonic);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("ghostty/session/stale-uuid");
+    try tmp.dir.writeFile(.{ .sub_path = "ghostty/session/stale-uuid/screen", .data = "old data" });
+
+    const ten_days_ago: i64 = std.time.timestamp() - 10 * 24 * 60 * 60;
+    var times = [2]std.c.timespec{
+        .{ .sec = ten_days_ago, .nsec = 0 },
+        .{ .sec = ten_days_ago, .nsec = 0 },
+    };
+    var stale_dir = try tmp.dir.openDir("ghostty/session/stale-uuid", .{});
+    defer stale_dir.close();
+    _ = std.c.utimensat(stale_dir.fd, "screen", &times, 0);
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+
+    const c_env = @cImport(@cInclude("stdlib.h"));
+    const prev_xdg = posix.getenv("XDG_STATE_HOME");
+    const base_z = try testing.allocator.dupeZ(u8, base);
+    defer testing.allocator.free(base_z);
+    _ = c_env.setenv("XDG_STATE_HOME", base_z.ptr, 1);
+    defer {
+        if (prev_xdg) |v| {
+            _ = c_env.setenv("XDG_STATE_HOME", v.ptr, 1);
+        } else {
+            _ = c_env.unsetenv("XDG_STATE_HOME");
+        }
+    }
+
+    try testing.expect(try cleanupStaleSessionsOnClose(testing.allocator));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("ghostty/session/stale-uuid/screen", .{}));
+
+    try tmp.dir.makePath("ghostty/session/stale-uuid-two");
+    try tmp.dir.writeFile(.{ .sub_path = "ghostty/session/stale-uuid-two/screen", .data = "old data" });
+    var stale_dir_two = try tmp.dir.openDir("ghostty/session/stale-uuid-two", .{});
+    defer stale_dir_two.close();
+    _ = std.c.utimensat(stale_dir_two.fd, "screen", &times, 0);
+
+    try testing.expect(!try cleanupStaleSessionsOnClose(testing.allocator));
+    try tmp.dir.access("ghostty/session/stale-uuid-two/screen", .{});
 }
 
 test "sessionDirPath uses XDG_STATE_HOME" {

@@ -697,6 +697,10 @@ pub fn deinit(self: *Termio) void {
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
     if (self.persisted) |*v| v.deinit(self.alloc);
+
+    _ = persisted_scrollback.cleanupStaleSessionsOnClose(self.alloc) catch |err| {
+        log.warn("stale session cleanup on close failed err={}", .{err});
+    };
 }
 
 pub fn threadEnter(
