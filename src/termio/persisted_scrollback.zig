@@ -12,7 +12,8 @@ const magic_header = "GSPH";
 const magic_metadata = "GSPM";
 const magic_screen = "GSPS";
 const current_version: u16 = 1;
-const header_size: usize = 22;
+const legacy_header_size: usize = 22;
+const header_size: usize = 23;
 const screen_prefix_size: usize = 14;
 const scrollback_record_prefix_size: usize = 12;
 
@@ -43,7 +44,16 @@ pub const Header = struct {
     timestamp: i64,
     cols: u16,
     rows: u16,
+    compression: ScrollbackCompression = scrollback_compression_default,
 };
+
+pub const ScrollbackCompression = enum(u8) {
+    none = 0,
+    gzip = 1,
+    zstd = 2,
+};
+
+const scrollback_compression_default: ScrollbackCompression = .gzip;
 
 pub const Metadata = struct {
     session_id: ?[]const u8 = null,
@@ -121,6 +131,7 @@ pub const Error = error{
     InvalidSnapshot,
     UnsupportedVersion,
     InvalidDimensions,
+    UnsupportedCompression,
 };
 
 /// Write component snapshot data to the session directory.
@@ -143,7 +154,11 @@ pub fn publishWithProgress(
     var dir = try openSessionDir(session_dir);
     defer dir.close();
 
-    if (capture.header) |header| {
+    const publish_header = headerForPublish(&dir, capture);
+    var scrollback_capture = capture;
+    scrollback_capture.header = publish_header;
+
+    if (publish_header) |header| {
         try writeHeaderReplacing(&dir, header);
         progress.header_written = true;
     }
@@ -192,17 +207,45 @@ pub fn publishWithProgress(
         var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer buf.deinit();
         try writeScrollbackRecords(&buf.writer, capture.scrollback_first_seq, capture.scrollback_append);
-        try writeFileAtomic(&dir, "scrollback", buf.writer.buffer[0..buf.writer.end]);
+
+        const compressed = try compressScrollbackAlloc(
+            std.heap.page_allocator,
+            scrollback_capture.header orelse try readHeaderFromDir(&dir),
+            buf.writer.buffer[0..buf.writer.end],
+        );
+        defer std.heap.page_allocator.free(compressed);
+        try writeFileAtomic(&dir, "scrollback", compressed);
         progress.scrollback_appended = true;
-        progress.scrollback_size_after = @intCast(buf.writer.end);
+        progress.scrollback_size_after = @intCast(compressed.len);
         progress.scrollback_record_count_after = capture.scrollback_append.len;
         progress.scrollback_tail_seq_after = if (capture.scrollback_append.len > 0)
             capture.scrollback_first_seq +% @as(u64, @intCast(capture.scrollback_append.len)) -% 1
         else
             0;
     } else if (capture.scrollback_append.len > 0) {
-        try appendScrollbackRecordsIdempotent(&dir, capture, progress);
+        try appendScrollbackRecordsIdempotent(&dir, scrollback_capture, progress);
     }
+}
+
+fn headerForPublish(dir: *std.fs.Dir, capture: Capture) ?Header {
+    const header = capture.header orelse return null;
+    if (capture.rewrite_scrollback or capture.scrollback_append.len == 0) return header;
+
+    const existing = readHeaderFromDir(dir) catch return header;
+    if (existing.compression == header.compression) return header;
+    dir.access("scrollback", .{}) catch |err| switch (err) {
+        error.FileNotFound => return header,
+        else => return header,
+    };
+
+    // Append-only publishes cannot reinterpret an existing uncompressed log as
+    // gzip. Keep the durable algorithm until a rewrite has all records in hand.
+    return .{
+        .timestamp = header.timestamp,
+        .cols = header.cols,
+        .rows = header.rows,
+        .compression = existing.compression,
+    };
 }
 
 /// Load a multi-file snapshot from a session directory.
@@ -229,7 +272,7 @@ pub fn load(
 
     // `scrollback-snapshot-limit` caps this append-only log only. Active screen
     // files are separate components with structural hard caps.
-    const scrollback_info = try readScrollback(alloc, &dir, limits.scrollback, &builder);
+    const scrollback_info = try readScrollback(alloc, &dir, limits.scrollback, header.compression, &builder);
     const scrollback_rows = builder.rowCount();
 
     const screen_raw = try readFileAllocDir(alloc, &dir, "screen", limits.screen);
@@ -409,6 +452,7 @@ fn headerBytes(header: Header) [header_size]u8 {
     std.mem.writeInt(i64, data[10..18], header.timestamp, .little);
     std.mem.writeInt(u16, data[18..20], header.cols, .little);
     std.mem.writeInt(u16, data[20..22], header.rows, .little);
+    data[22] = @intFromEnum(header.compression);
     return data;
 }
 
@@ -435,18 +479,33 @@ fn writeHeaderReplacing(dir: *std.fs.Dir, header: Header) !void {
 }
 
 fn readHeader(data: []const u8) Error!Header {
-    if (data.len != header_size) return error.InvalidSnapshot;
+    if (data.len != legacy_header_size and data.len != header_size) return error.InvalidSnapshot;
     if (!std.mem.eql(u8, data[0..4], magic_header)) return error.InvalidSnapshot;
     const version = std.mem.readInt(u16, data[4..6], .little);
     if (version != current_version) return error.UnsupportedVersion;
     const cols = std.mem.readInt(u16, data[18..20], .little);
     const rows = std.mem.readInt(u16, data[20..22], .little);
     if (cols == 0 or rows == 0) return error.InvalidDimensions;
+    const compression: ScrollbackCompression = if (data.len == legacy_header_size)
+        .none
+    else switch (data[22]) {
+        @intFromEnum(ScrollbackCompression.none) => .none,
+        @intFromEnum(ScrollbackCompression.gzip) => .gzip,
+        @intFromEnum(ScrollbackCompression.zstd) => .zstd,
+        else => return error.UnsupportedCompression,
+    };
     return .{
         .timestamp = std.mem.readInt(i64, data[10..18], .little),
         .cols = cols,
         .rows = rows,
+        .compression = compression,
     };
+}
+
+fn readHeaderFromDir(dir: *std.fs.Dir) !Header {
+    const raw = try readFileAllocDir(std.heap.page_allocator, dir, "header", 4096);
+    defer std.heap.page_allocator.free(raw);
+    return try readHeader(raw);
 }
 
 fn writeMetadata(writer: *std.Io.Writer, metadata: Metadata) !void {
@@ -509,28 +568,21 @@ fn writeScrollbackRecords(
     }
 }
 
-fn readScrollbackDiskState(file: *std.fs.File) !ScrollbackDiskState {
-    const stat = try file.stat();
-    try file.seekTo(0);
+fn readScrollbackDiskStateBytes(data: []const u8, disk_size: u64) !ScrollbackDiskState {
+    var state: ScrollbackDiskState = .{ .size = disk_size };
+    var pos: usize = 0;
+    while (pos < data.len) {
+        if (data.len - pos < scrollback_record_prefix_size) return error.InvalidSnapshot;
 
-    var state: ScrollbackDiskState = .{ .size = stat.size };
-    var pos: u64 = 0;
-    while (pos < stat.size) {
-        if (stat.size - pos < scrollback_record_prefix_size) return error.InvalidSnapshot;
-
-        var prefix: [scrollback_record_prefix_size]u8 = undefined;
-        const read_len = try file.readAll(&prefix);
-        if (read_len != scrollback_record_prefix_size) return error.InvalidSnapshot;
-
+        const prefix = data[pos..][0..scrollback_record_prefix_size];
         const seq = std.mem.readInt(u64, prefix[0..8], .big);
         const len = std.mem.readInt(u32, prefix[8..12], .big);
         if (state.has_records and seq <= state.tail_seq) return error.InvalidSnapshot;
 
         pos += scrollback_record_prefix_size;
-        if (stat.size - pos < len) return error.InvalidSnapshot;
+        if (data.len - pos < len) return error.InvalidSnapshot;
 
         pos += len;
-        try file.seekTo(pos);
 
         state.tail_seq = seq;
         state.record_count += 1;
@@ -540,11 +592,196 @@ fn readScrollbackDiskState(file: *std.fs.File) !ScrollbackDiskState {
     return state;
 }
 
+fn decompressScrollbackAlloc(
+    alloc: Allocator,
+    compression: ScrollbackCompression,
+    data: []const u8,
+) (Allocator.Error || Error)![]u8 {
+    return switch (compression) {
+        .none => try alloc.dupe(u8, data),
+        .gzip => try decompressGzipMembersAlloc(alloc, data),
+        .zstd => error.UnsupportedCompression,
+    };
+}
+
+fn compressScrollbackAlloc(
+    alloc: Allocator,
+    header: Header,
+    data: []const u8,
+) (Allocator.Error || Error || std.Io.Writer.Error)![]u8 {
+    return switch (header.compression) {
+        .none => try alloc.dupe(u8, data),
+        .gzip => try compressGzipFixedAlloc(alloc, data),
+        .zstd => error.UnsupportedCompression,
+    };
+}
+
+fn appendCompressedScrollback(
+    alloc: Allocator,
+    file: *std.fs.File,
+    header: Header,
+    data: []const u8,
+) !void {
+    const compressed = try compressScrollbackAlloc(alloc, header, data);
+    defer alloc.free(compressed);
+
+    try file.seekFromEnd(0);
+    try file.writeAll(compressed);
+}
+
+fn decompressGzipMembersAlloc(alloc: Allocator, data: []const u8) (Allocator.Error || Error)![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+
+    var in: std.Io.Reader = .fixed(data);
+    while (in.seek < in.end) {
+        var gzip_stream: std.compress.flate.Decompress = .init(&in, .gzip, &.{});
+        _ = gzip_stream.reader.streamRemaining(&out.writer) catch return error.InvalidSnapshot;
+        if (gzip_stream.err) |_| return error.InvalidSnapshot;
+    }
+
+    return out.toOwnedSlice();
+}
+
+const DeflateBitWriter = struct {
+    writer: *std.Io.Writer,
+    bits: u32 = 0,
+    bit_count: u5 = 0,
+
+    fn writeBits(self: *DeflateBitWriter, value: u16, bit_count: u5) !void {
+        self.bits |= @as(u32, value) << self.bit_count;
+        self.bit_count += bit_count;
+        while (self.bit_count >= 8) {
+            try self.writer.writeByte(@truncate(self.bits));
+            self.bits >>= 8;
+            self.bit_count -= 8;
+        }
+    }
+
+    fn finish(self: *DeflateBitWriter) !void {
+        if (self.bit_count == 0) return;
+        try self.writer.writeByte(@truncate(self.bits));
+        self.bits = 0;
+        self.bit_count = 0;
+    }
+};
+
+fn reverseBits(value: u16, bit_count: u5) u16 {
+    var result: u16 = 0;
+    var i: u5 = 0;
+    while (i < bit_count) : (i += 1) {
+        result = (result << 1) | ((value >> @as(u4, @intCast(i))) & 1);
+    }
+    return result;
+}
+
+fn writeFixedCode(bits: *DeflateBitWriter, symbol: u16) !void {
+    const code: u16, const bit_count: u5 = switch (symbol) {
+        0...143 => .{ 0b0011_0000 + symbol, 8 },
+        144...255 => .{ 0b1_1001_0000 + (symbol - 144), 9 },
+        256...279 => .{ symbol - 256, 7 },
+        280...287 => .{ 0b1100_0000 + (symbol - 280), 8 },
+        else => return error.InvalidSnapshot,
+    };
+    try bits.writeBits(reverseBits(code, bit_count), bit_count);
+}
+
+const LengthCode = struct {
+    code: u16,
+    extra: u16,
+    extra_bits: u5,
+};
+
+fn lengthCode(length: u16) Error!LengthCode {
+    const bases = [_]u16{
+        3,   4,   5,   6,   7,   8,  9,  10,
+        11,  13,  15,  17,  19,  23, 27, 31,
+        35,  43,  51,  59,  67,  83, 99, 115,
+        131, 163, 195, 227, 258,
+    };
+    const extra_bits = [_]u5{
+        0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 2, 2, 2, 2,
+        3, 3, 3, 3, 4, 4, 4, 4,
+        5, 5, 5, 5, 0,
+    };
+
+    if (length < 3 or length > 258) return error.InvalidSnapshot;
+    for (bases, extra_bits, 0..) |base, bits, index| {
+        const span: u16 = if (bits == 0) 1 else @as(u16, 1) << @as(u4, @intCast(bits));
+        if (length >= base and length < base + span) {
+            return .{
+                .code = @intCast(257 + index),
+                .extra = length - base,
+                .extra_bits = bits,
+            };
+        }
+    }
+
+    return error.InvalidSnapshot;
+}
+
+fn writeLengthDistance(bits: *DeflateBitWriter, length: u16) !void {
+    const len_code = try lengthCode(length);
+    try writeFixedCode(bits, len_code.code);
+    if (len_code.extra_bits > 0) try bits.writeBits(len_code.extra, len_code.extra_bits);
+    // The simple encoder only emits distance=1 matches for repeated bytes.
+    try bits.writeBits(0, 5);
+}
+
+/// Emit a small gzip member using a single fixed-Huffman deflate block.
+/// Zig 0.15.2 ships gzip decompression, but its flate compressor is not a
+/// usable public API in this fork's toolchain. Scrollback snapshots contain
+/// long runs of zeroed cell/style data, so distance=1 RLE matches recover the
+/// important space win without adding a fork-local dependency.
+fn compressGzipFixedAlloc(alloc: Allocator, data: []const u8) (Allocator.Error || std.Io.Writer.Error || Error)![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+
+    try out.writer.writeAll(&[_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 });
+
+    var bits: DeflateBitWriter = .{ .writer = &out.writer };
+    try bits.writeBits(1, 1);
+    try bits.writeBits(0b01, 2);
+
+    var pos: usize = 0;
+    while (pos < data.len) {
+        if (pos > 0) {
+            var run_len: usize = 0;
+            while (pos + run_len < data.len and
+                data[pos + run_len] == data[pos - 1] and
+                run_len < 258) : (run_len += 1)
+            {}
+
+            if (run_len >= 3) {
+                try writeLengthDistance(&bits, @intCast(run_len));
+                pos += run_len;
+                continue;
+            }
+        }
+
+        try writeFixedCode(&bits, data[pos]);
+        pos += 1;
+    }
+
+    try writeFixedCode(&bits, 256);
+    try bits.finish();
+
+    var crc = std.hash.Crc32.init();
+    crc.update(data);
+    try out.writer.writeInt(u32, crc.final(), .little);
+    try out.writer.writeInt(u32, @truncate(data.len), .little);
+
+    return out.toOwnedSlice();
+}
+
 fn appendScrollbackRecordsIdempotent(
     dir: *std.fs.Dir,
     capture: Capture,
     progress: *PublishProgress,
 ) !void {
+    const header = capture.header orelse try readHeaderFromDir(dir);
+
     var file = dir.openFile("scrollback", .{ .mode = .read_write }) catch |err| switch (err) {
         error.FileNotFound => try dir.createFile("scrollback", .{
             .read = true,
@@ -555,7 +792,13 @@ fn appendScrollbackRecordsIdempotent(
     };
     defer file.close();
 
-    const disk_state = try readScrollbackDiskState(&file);
+    const disk_stat = try file.stat();
+    try file.seekTo(0);
+    const disk_raw = try file.readToEndAlloc(std.heap.page_allocator, std.math.maxInt(usize));
+    defer std.heap.page_allocator.free(disk_raw);
+    const disk_data = try decompressScrollbackAlloc(std.heap.page_allocator, header.compression, disk_raw);
+    defer std.heap.page_allocator.free(disk_data);
+    const disk_state = try readScrollbackDiskStateBytes(disk_data, disk_stat.size);
     var first_seq = capture.scrollback_first_seq;
     var records = capture.scrollback_append;
     if (disk_state.has_records and disk_state.tail_seq >= first_seq) {
@@ -575,8 +818,6 @@ fn appendScrollbackRecordsIdempotent(
 
     if (records.len == 0) return;
 
-    try file.seekFromEnd(0);
-
     // Serialize records into a heap buffer, then writeAll. The buffered
     // std.Io.Writer interface tracks its own pos starting at 0 and ignores
     // the file's kernel seek cursor (it uses pwrite under the hood), so write
@@ -584,7 +825,12 @@ fn appendScrollbackRecordsIdempotent(
     var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer buf.deinit();
     try writeScrollbackRecords(&buf.writer, first_seq, records);
-    try file.writeAll(buf.writer.buffer[0..buf.writer.end]);
+    try appendCompressedScrollback(
+        std.heap.page_allocator,
+        &file,
+        header,
+        buf.writer.buffer[0..buf.writer.end],
+    );
 
     const stat = try file.stat();
     progress.scrollback_tail_seq_after = first_seq +% @as(u64, @intCast(records.len)) -% 1;
@@ -596,12 +842,16 @@ fn readScrollback(
     alloc: Allocator,
     dir: *std.fs.Dir,
     max_len: usize,
+    compression: ScrollbackCompression,
     builder: *ScreenBuilder,
 ) (Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError || Error || snapshot.Error)!ScrollbackInfo {
-    const data = readFileAllocDir(alloc, dir, "scrollback", max_len) catch |err| switch (err) {
+    const raw = readFileAllocDir(alloc, dir, "scrollback", max_len) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
+    defer alloc.free(raw);
+
+    const data = try decompressScrollbackAlloc(alloc, compression, raw);
     defer alloc.free(data);
 
     var pos: usize = 0;
@@ -859,6 +1109,22 @@ fn fileSize(dir: *std.fs.Dir, path: []const u8) !u64 {
     return stat.size;
 }
 
+fn expectScrollbackPrefixEqual(alloc: Allocator, loaded: *const Loaded, expected_bytes: []const u8) !void {
+    const testing = std.testing;
+
+    var expected = try snapshot.readScreenData(alloc, expected_bytes);
+    defer expected.deinit(alloc);
+
+    try testing.expectEqual(expected.rows.len, loaded.scrollback_rows);
+    try testing.expect(loaded.primary.rows.len >= expected.rows.len);
+    for (expected.rows, loaded.primary.rows[0..expected.rows.len]) |expected_row, actual_row| {
+        try testing.expectEqual(expected_row.wrap, actual_row.wrap);
+        try testing.expectEqual(expected_row.wrap_continuation, actual_row.wrap_continuation);
+        try testing.expectEqual(expected_row.semantic_prompt, actual_row.semantic_prompt);
+        try testing.expectEqualSlices(u64, expected_row.cells, actual_row.cells);
+    }
+}
+
 test "cleanupStaleSessions deletes expired and keeps fresh" {
     const testing = std.testing;
 
@@ -995,6 +1261,154 @@ test "persisted scrollback binary snapshot roundtrip" {
     try testing.expectEqualStrings("/tmp/test", loaded.pwd.?);
     try testing.expectEqualStrings("test title", loaded.title.?);
     try testing.expectEqual(@as(usize, 24), loaded.primary.rows.len);
+}
+
+test "persisted scrollback compresses scrollback log and roundtrips" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    var term = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 32,
+        .rows = 4,
+        .max_scrollback = 16 * 1024,
+    });
+    defer term.deinit(testing.allocator);
+
+    var input: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer input.deinit();
+    for (0..80) |_| try input.writer.writeAll("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    try term.printString(input.writer.buffer[0..input.writer.end]);
+
+    const primary = term.screens.get(.primary) orelse term.screens.active;
+    const scrollback = try writeScreenBytes(testing.allocator, primary, 0, 32);
+    defer testing.allocator.free(scrollback);
+    const screen = try writeScreenBytes(testing.allocator, primary, 32, 4);
+    defer testing.allocator.free(screen);
+
+    _ = try publish(session_path, .{
+        .header = .{ .timestamp = 10, .cols = 32, .rows = 4 },
+        .scrollback_append = &.{.{ .bytes = scrollback }},
+        .screen = screen,
+        .screen_seq = 100,
+    });
+
+    var dir = try std.fs.openDirAbsolute(session_path, .{});
+    defer dir.close();
+    const compressed_size = try fileSize(&dir, "scrollback");
+    try testing.expect(compressed_size < scrollback_record_prefix_size + scrollback.len);
+
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
+    defer loaded.deinit(testing.allocator);
+    try expectScrollbackPrefixEqual(testing.allocator, &loaded, scrollback);
+}
+
+test "persisted scrollback load accepts uncompressed scrollback log" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    var term = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 16,
+        .rows = 3,
+        .max_scrollback = 4096,
+    });
+    defer term.deinit(testing.allocator);
+    try term.printString("legacy-one\nlegacy-two\nlegacy-three\nlegacy-four\nlegacy-five");
+
+    const primary = term.screens.get(.primary) orelse term.screens.active;
+    const scrollback = try writeScreenBytes(testing.allocator, primary, 0, 2);
+    defer testing.allocator.free(scrollback);
+    const screen = try writeScreenBytes(testing.allocator, primary, 2, 3);
+    defer testing.allocator.free(screen);
+
+    var dir = try std.fs.openDirAbsolute(session_path, .{});
+    defer dir.close();
+    try writeHeaderReplacing(&dir, .{
+        .timestamp = 11,
+        .cols = 16,
+        .rows = 3,
+        .compression = .none,
+    });
+    var scrollback_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer scrollback_buf.deinit();
+    try writeScrollbackRecords(&scrollback_buf.writer, 0, &.{.{ .bytes = scrollback }});
+    try writeFileAtomic(&dir, "scrollback", scrollback_buf.writer.buffer[0..scrollback_buf.writer.end]);
+    var screen_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer screen_buf.deinit();
+    try writeScreenFile(&screen_buf.writer, 100, screen);
+    try writeFileAtomic(&dir, "screen", screen_buf.writer.buffer[0..screen_buf.writer.end]);
+
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
+    defer loaded.deinit(testing.allocator);
+    try expectScrollbackPrefixEqual(testing.allocator, &loaded, scrollback);
+}
+
+test "persisted scrollback gzip members append and load as one log" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("session");
+    const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+
+    var term = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 24,
+        .rows = 4,
+        .max_scrollback = 8192,
+    });
+    defer term.deinit(testing.allocator);
+    try term.printString(
+        "first append keeps this row\n" ++
+            "first append keeps this row\n" ++
+            "second append keeps this row\n" ++
+            "second append keeps this row\n",
+    );
+
+    const primary = term.screens.get(.primary) orelse term.screens.active;
+    const first = try writeScreenBytes(testing.allocator, primary, 0, 1);
+    defer testing.allocator.free(first);
+    const second = try writeScreenBytes(testing.allocator, primary, 1, 1);
+    defer testing.allocator.free(second);
+    const screen = try writeScreenBytes(testing.allocator, primary, 2, 4);
+    defer testing.allocator.free(screen);
+
+    _ = try publish(session_path, .{
+        .header = .{ .timestamp = 12, .cols = 24, .rows = 4 },
+        .scrollback_append = &.{.{ .bytes = first }},
+        .screen = screen,
+        .screen_seq = 100,
+    });
+    _ = try publish(session_path, .{
+        .scrollback_first_seq = 1,
+        .scrollback_append = &.{.{ .bytes = second }},
+        .screen = screen,
+        .screen_seq = 101,
+    });
+
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), loaded.scrollback_rows);
+
+    var expected_first = try snapshot.readScreenData(testing.allocator, first);
+    defer expected_first.deinit(testing.allocator);
+    var expected_second = try snapshot.readScreenData(testing.allocator, second);
+    defer expected_second.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(u64, expected_first.rows[0].cells, loaded.primary.rows[0].cells);
+    try testing.expectEqualSlices(u64, expected_second.rows[0].cells, loaded.primary.rows[1].cells);
 }
 
 test "load returns full screen when scrollback is empty" {
