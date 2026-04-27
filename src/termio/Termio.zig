@@ -1703,8 +1703,26 @@ fn applyPersistedPublishProgress(
 }
 
 const PersistedScrollbackFlushThread = struct {
+    const State = enum(u8) {
+        running,
+        completed,
+        detached,
+    };
+
+    alloc: Allocator,
     io: *Termio,
     err: ?anyerror = null,
+    done: std.Thread.ResetEvent = .{},
+    state: std.atomic.Value(u8) = .init(@intFromEnum(State.running)),
+
+    fn create(alloc: Allocator, io: *Termio) Allocator.Error!*PersistedScrollbackFlushThread {
+        const self = try alloc.create(PersistedScrollbackFlushThread);
+        self.* = .{
+            .alloc = alloc,
+            .io = io,
+        };
+        return self;
+    }
 
     fn run(self: *PersistedScrollbackFlushThread) void {
         if (comptime builtin.target.os.tag == .macos) {
@@ -1723,6 +1741,20 @@ const PersistedScrollbackFlushThread = struct {
         self.io.flushPersistedScrollbackOnCurrentThread() catch |err| {
             self.err = err;
         };
+
+        if (self.state.cmpxchgStrong(
+            @intFromEnum(State.running),
+            @intFromEnum(State.completed),
+            .release,
+            .acquire,
+        )) |state| {
+            assert(state == @intFromEnum(State.detached));
+            self.done.set();
+            self.alloc.destroy(self);
+            return;
+        }
+
+        self.done.set();
     }
 };
 
@@ -1735,11 +1767,43 @@ const PersistedScrollbackFlushThread = struct {
 /// `scrollback-persist-screen-interval-ms` of activity may be lost in a
 /// crash. Final flushes on session close, focus loss, and SIGTERM
 /// (phase-3) reduce the window in practice.
-pub fn flushPersistedScrollback(self: *Termio) !void {
+pub fn flushPersistedScrollback(self: *Termio, deadline_ns: ?u64) !void {
     if (comptime builtin.target.os.tag == .macos) {
-        var ctx: PersistedScrollbackFlushThread = .{ .io = self };
-        const thread = try std.Thread.spawn(.{}, PersistedScrollbackFlushThread.run, .{&ctx});
+        if (deadline_ns == null) {
+            var ctx: PersistedScrollbackFlushThread = .{
+                .alloc = self.alloc,
+                .io = self,
+            };
+            const thread = try std.Thread.spawn(.{}, PersistedScrollbackFlushThread.run, .{&ctx});
+            thread.join();
+            if (ctx.err) |err| return err;
+            return;
+        }
+
+        const ctx = try PersistedScrollbackFlushThread.create(self.alloc, self);
+        errdefer self.alloc.destroy(ctx);
+
+        const thread = try std.Thread.spawn(.{}, PersistedScrollbackFlushThread.run, .{ctx});
+        ctx.done.timedWait(deadline_ns.?) catch {
+            if (ctx.state.cmpxchgStrong(
+                @intFromEnum(PersistedScrollbackFlushThread.State.running),
+                @intFromEnum(PersistedScrollbackFlushThread.State.detached),
+                .release,
+                .acquire,
+            )) |state| {
+                assert(state == @intFromEnum(PersistedScrollbackFlushThread.State.completed));
+                thread.join();
+                defer self.alloc.destroy(ctx);
+                if (ctx.err) |err| return err;
+                return;
+            }
+
+            thread.detach();
+            return error.Timeout;
+        };
+
         thread.join();
+        defer self.alloc.destroy(ctx);
         if (ctx.err) |err| return err;
         return;
     }
@@ -2073,7 +2137,7 @@ test "persisted scrollback capture enforces byte limit with recent tail rows" {
     const total_rows = terminalpkg.snapshot.screenRowCount(&io.terminal.screens.active.*);
     const history_rows = total_rows - @min(total_rows, io.terminal.screens.active.pages.rows);
 
-    try io.flushPersistedScrollback();
+    try io.flushPersistedScrollback(null);
 
     var dir = try std.fs.openDirAbsolute(session_path, .{});
     defer dir.close();
@@ -2122,7 +2186,7 @@ test "persisted scrollback load accepts normal screen with small scrollback limi
     for (0..40) |i| try input.writer.print("row-{d:0>2}\n", .{i});
     try io.terminal.printString(input.writer.buffer[0..input.writer.end]);
 
-    try io.flushPersistedScrollback();
+    try io.flushPersistedScrollback(null);
 
     var dir = try std.fs.openDirAbsolute(session_path, .{});
     defer dir.close();
@@ -2169,7 +2233,7 @@ test "persisted scrollback load accepts captured screen larger than legacy read 
         io.terminal.deinit(testing.allocator);
     }
 
-    try io.flushPersistedScrollback();
+    try io.flushPersistedScrollback(null);
 
     var dir = try std.fs.openDirAbsolute(session_path, .{});
     defer dir.close();
@@ -2212,7 +2276,7 @@ test "persisted scrollback capture rewrites after resize reflow" {
     }
 
     try io.terminal.printString("abcdefghijABCDEFGHIJ\nklmnopqrstKLMNOPQRST\nuvwxyzabcdUVWXYZABCD\n");
-    try io.flushPersistedScrollback();
+    try io.flushPersistedScrollback(null);
 
     try io.terminal.resize(testing.allocator, 5, 3);
     io.markPersistedScrollbackInvalidatedLocked();
@@ -2221,7 +2285,7 @@ test "persisted scrollback capture rewrites after resize reflow" {
     var expected = try capturePrimarySnapshotForTest(testing.allocator, &io.terminal);
     defer expected.deinit(testing.allocator);
 
-    try io.flushPersistedScrollback();
+    try io.flushPersistedScrollback(null);
 
     var loaded = try persisted_scrollback.load(testing.allocator, session_path, .{ .scrollback = 64 * 1024 });
     defer loaded.deinit(testing.allocator);
@@ -2509,7 +2573,7 @@ test "persisted scrollback capture skips first write before lazy threshold" {
     io.persisted.?.header_written = false;
 
     try io.terminal.printString("short-lived output\n");
-    try io.flushPersistedScrollback();
+    try io.flushPersistedScrollback(null);
 
     try testing.expectError(error.FileNotFound, tmp_dir.dir.statFile("lazy-session"));
     try testing.expect(io.persisted.?.dirty);

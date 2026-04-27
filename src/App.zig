@@ -27,6 +27,9 @@ alloc: Allocator,
 /// The list of surfaces that are currently active.
 surfaces: SurfaceList,
 
+/// Synchronizes cross-thread snapshots of the active surface list.
+surfaces_mutex: std.Thread.Mutex = .{},
+
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
 /// focused, i.e. may an about window. On macOS, this concept is known
@@ -175,7 +178,11 @@ pub fn addSurface(
     self: *App,
     rt_surface: *apprt.Surface,
 ) Allocator.Error!void {
-    try self.surfaces.append(self.alloc, rt_surface);
+    {
+        self.surfaces_mutex.lock();
+        defer self.surfaces_mutex.unlock();
+        try self.surfaces.append(self.alloc, rt_surface);
+    }
 
     // Since we have non-zero surfaces, we can cancel the quit timer.
     // It is up to the apprt if there is a quit timer at all and if it
@@ -202,19 +209,26 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
         }
     }
 
-    var i: usize = 0;
-    while (i < self.surfaces.items.len) {
-        if (self.surfaces.items[i] == rt_surface) {
-            _ = self.surfaces.swapRemove(i);
-            continue;
+    const was_empty = was_empty: {
+        self.surfaces_mutex.lock();
+        defer self.surfaces_mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.surfaces.items.len) {
+            if (self.surfaces.items[i] == rt_surface) {
+                _ = self.surfaces.swapRemove(i);
+                continue;
+            }
+
+            i += 1;
         }
 
-        i += 1;
-    }
+        break :was_empty self.surfaces.items.len == 0;
+    };
 
     // If we have no surfaces, we can start the quit timer. It is up to the
     // apprt to determine if this is necessary.
-    if (self.surfaces.items.len == 0) _ = rt_surface.rtApp().performAction(
+    if (was_empty) _ = rt_surface.rtApp().performAction(
         .app,
         .quit_timer,
         .start,

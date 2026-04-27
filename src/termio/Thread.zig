@@ -536,7 +536,7 @@ fn stopCallback(
 ) xev.CallbackAction {
     _ = r catch unreachable;
     const cb = cb_.?;
-    cb.io.flushPersistedScrollback() catch |err| {
+    cb.io.flushPersistedScrollback(null) catch |err| {
         log.warn("error flushing persisted scrollback during stop err={}", .{err});
     };
     cb.self.loop.stop();
@@ -566,7 +566,7 @@ fn persistedScrollbackCallback(
         .flush => {
             log.debug("persisted scrollback flush reason=background", .{});
             cb.io.persistedScrollbackFlushStarted();
-            cb.io.flushPersistedScrollback() catch |err| {
+            cb.io.flushPersistedScrollback(null) catch |err| {
                 log.warn("error flushing persisted scrollback err={}", .{err});
                 const retry_ms = cb.io.persistedScrollbackFlushFailed();
                 cb.self.startPersistedScrollbackTimerDelay(cb, retry_ms);
@@ -603,7 +603,7 @@ fn terminationGraceCallback(
 
     cb.io.persistedScrollbackFlushStarted();
     const result: termio.Termio.TerminationResult = result: {
-        cb.io.flushPersistedScrollback() catch |err| {
+        cb.io.flushPersistedScrollback(null) catch |err| {
             log.warn("error flushing persisted scrollback during termination err={}", .{err});
             break :result .flush_failed;
         };

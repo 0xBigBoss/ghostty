@@ -1377,6 +1377,80 @@ pub const Inspector = struct {
     }
 };
 
+const PersistAllResult = struct {
+    attempted: usize = 0,
+    timed_out: usize = 0,
+    failed: usize = 0,
+    skipped: usize = 0,
+};
+
+fn instantSinceSafeNs(later: std.time.Instant, earlier: std.time.Instant) u64 {
+    return switch (later.order(earlier)) {
+        .lt => 0,
+        .eq, .gt => later.since(earlier),
+    };
+}
+
+fn persistAllSurfacesBounded(
+    comptime SurfacePtr: type,
+    comptime Context: type,
+    surfaces: []const SurfacePtr,
+    timeout_ms: u32,
+    context: *Context,
+    flush: *const fn (*Context, SurfacePtr, ?u64) anyerror!void,
+) PersistAllResult {
+    const total_budget_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    var result: PersistAllResult = .{};
+
+    if (total_budget_ns == 0) {
+        result.skipped = surfaces.len;
+        if (surfaces.len > 0) {
+            log.warn("persist_all budget exhausted skipped_count={}", .{surfaces.len});
+        }
+        return result;
+    }
+
+    const start = std.time.Instant.now() catch null;
+    for (surfaces, 0..) |surface, i| {
+        const deadline_ns: ?u64 = deadline: {
+            const started_at = start orelse break :deadline null;
+            const now = std.time.Instant.now() catch break :deadline null;
+            const elapsed_ns = instantSinceSafeNs(now, started_at);
+            if (elapsed_ns >= total_budget_ns) {
+                result.skipped = surfaces.len - i;
+                log.warn("persist_all budget exhausted skipped_count={}", .{result.skipped});
+                return result;
+            }
+
+            break :deadline total_budget_ns - elapsed_ns;
+        };
+
+        result.attempted += 1;
+        flush(context, surface, deadline_ns) catch |err| switch (err) {
+            error.Timeout => {
+                result.timed_out += 1;
+                log.warn("persisted scrollback flush timed out timeout_ns={}", .{deadline_ns orelse 0});
+            },
+            else => {
+                result.failed += 1;
+                log.warn("error flushing persisted scrollback during app persist all err={}", .{err});
+            },
+        };
+    }
+
+    return result;
+}
+
+const PersistAllFlushContext = struct {};
+
+fn persistAllFlush(
+    _: *PersistAllFlushContext,
+    surface: *apprt.Surface,
+    deadline_ns: ?u64,
+) !void {
+    try surface.core().io.flushPersistedScrollback(deadline_ns);
+}
+
 // C API
 pub const CAPI = struct {
     const global = &@import("../global.zig").state;
@@ -1578,12 +1652,29 @@ pub const CAPI = struct {
         };
     }
 
-    export fn ghostty_app_persist_all(v: *App) void {
-        for (v.core_app.surfaces.items) |surface| {
-            surface.core().io.flushPersistedScrollback() catch |err| {
-                log.warn("error flushing persisted scrollback during app persist all err={}", .{err});
+    export fn ghostty_app_persist_all(v: *App, timeout_ms: u32) void {
+        var snapshot: std.ArrayListUnmanaged(*apprt.Surface) = .{};
+        defer snapshot.deinit(v.core_app.alloc);
+
+        {
+            v.core_app.surfaces_mutex.lock();
+            defer v.core_app.surfaces_mutex.unlock();
+
+            snapshot.appendSlice(v.core_app.alloc, v.core_app.surfaces.items) catch |err| {
+                log.warn("error snapshotting surfaces for persist_all err={}", .{err});
+                return;
             };
         }
+
+        var context: PersistAllFlushContext = .{};
+        _ = persistAllSurfacesBounded(
+            *apprt.Surface,
+            PersistAllFlushContext,
+            snapshot.items,
+            timeout_ms,
+            &context,
+            persistAllFlush,
+        );
     }
 
     /// Return the userdata associated with the app.
@@ -2405,4 +2496,55 @@ test "ghostty.h surface config has surface_uuid for session identity" {
     try testing.expect(@hasField(c.ghostty_surface_config_s, "surface_uuid"));
     try testing.expect(@hasDecl(c, "ghostty_app_persist_all"));
     try testing.expect(!@hasDecl(c, "ghostty_surface_export_snapshot"));
+}
+
+const PersistAllTestSurface = struct {
+    flushed: bool = false,
+};
+
+const PersistAllTestContext = struct {
+    attempts: usize = 0,
+};
+
+fn persistAllTestFlush(
+    context: *PersistAllTestContext,
+    surface: *PersistAllTestSurface,
+    deadline_ns: ?u64,
+) !void {
+    context.attempts += 1;
+    surface.flushed = true;
+
+    // The real Termio implementation waits up to the supplied per-surface
+    // deadline. Sleeping past it forces the budget code to skip remaining
+    // surfaces instead of serially blocking on each one.
+    std.time.sleep((deadline_ns orelse 0) + (20 * std.time.ns_per_ms));
+    return error.Timeout;
+}
+
+test "ghostty_app_persist_all budget skips surfaces after timeout" {
+    const testing = std.testing;
+
+    var surfaces: [3]PersistAllTestSurface = .{ .{}, .{}, .{} };
+    var context: PersistAllTestContext = .{};
+
+    const timeout_ms: u32 = 5;
+    const start = try std.time.Instant.now();
+    const result = persistAllSurfacesBounded(
+        *PersistAllTestSurface,
+        PersistAllTestContext,
+        surfaces[0..],
+        timeout_ms,
+        &context,
+        persistAllTestFlush,
+    );
+    const elapsed_ns = (try std.time.Instant.now()).since(start);
+
+    try testing.expect(elapsed_ns < (@as(u64, timeout_ms + 200) * std.time.ns_per_ms));
+    try testing.expectEqual(@as(usize, 1), result.attempted);
+    try testing.expectEqual(@as(usize, 1), result.timed_out);
+    try testing.expectEqual(@as(usize, 2), result.skipped);
+    try testing.expect(surfaces[0].flushed);
+    try testing.expect(!surfaces[1].flushed);
+    try testing.expect(!surfaces[2].flushed);
+    try testing.expectEqual(@as(usize, 1), context.attempts);
 }
