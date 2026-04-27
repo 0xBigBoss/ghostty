@@ -156,6 +156,8 @@ const ThreadEnterState = struct {
 const PersistedState = struct {
     session_dir: []u8,
     session_id: ?[]u8,
+    // `scrollback-snapshot-limit` caps the on-disk scrollback log file only.
+    // Screen, header, and metadata components use internal structural caps.
     limit: usize,
     last_persisted_row_count: usize = 0,
     last_persisted_seq: u64 = 0,
@@ -422,7 +424,9 @@ fn maybeLoadPersistedScrollback(
     };
     defer alloc.free(path);
 
-    const loaded = persisted_scrollback.load(alloc, path, limit) catch |err| {
+    const loaded = persisted_scrollback.load(alloc, path, .{
+        .scrollback = limit,
+    }) catch |err| {
         log.warn("persisted scrollback restore skipped path={s} err={}", .{ path, err });
         return null;
     };
@@ -1678,7 +1682,7 @@ test "maybeLoadPersistedScrollback leaves malformed session files in place" {
     // Call load directly to verify the file is not deleted on parse failure.
     try testing.expectError(
         error.InvalidSnapshot,
-        persisted_scrollback.load(testing.allocator, victim_path, 1024),
+        persisted_scrollback.load(testing.allocator, victim_path, .{ .scrollback = 1024 }),
     );
     // Directory should still exist after the failed load.
     var dir = try std.fs.openDirAbsolute(victim_path, .{});
@@ -1827,12 +1831,63 @@ test "persisted scrollback capture enforces byte limit with recent tail rows" {
     const scrollback_stat = try dir.statFile("scrollback");
     try testing.expect(scrollback_stat.size <= 1024);
 
-    var loaded = try persisted_scrollback.load(testing.allocator, session_path, 1024);
+    var loaded = try persisted_scrollback.load(testing.allocator, session_path, .{ .scrollback = 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expect(loaded.scrollback_rows < history_rows);
     try testing.expect(screenDataContainsAscii(&loaded.primary, "row-39"));
     try testing.expect(!screenDataContainsAscii(&loaded.primary, "row-00"));
+}
+
+test "persisted scrollback load accepts normal screen with small scrollback limit" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("session");
+
+    const session_path = try tmp_dir.dir.realpathAlloc(testing.allocator, "session");
+    defer testing.allocator.free(session_path);
+    const session_dir = try testing.allocator.dupe(u8, session_path);
+
+    var terminal = try terminalpkg.Terminal.init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback = 100,
+    });
+
+    var mutex = std.Thread.Mutex{};
+    var state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &terminal,
+    };
+    var io = persistedTestTermio(testing.allocator, session_dir, terminal, &state, 1024);
+    state.terminal = &io.terminal;
+    defer {
+        if (io.persisted) |*persisted| persisted.deinit(testing.allocator);
+        io.terminal.deinit(testing.allocator);
+    }
+
+    var input: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer input.deinit();
+    for (0..40) |i| try input.writer.print("row-{d:0>2}\n", .{i});
+    try io.terminal.printString(input.writer.buffer[0..input.writer.end]);
+
+    try io.flushPersistedScrollback();
+
+    var dir = try std.fs.openDirAbsolute(session_path, .{});
+    defer dir.close();
+    const scrollback_stat = try dir.statFile("scrollback");
+    try testing.expect(scrollback_stat.size <= 1024);
+
+    const screen_stat = try dir.statFile("screen");
+    try testing.expect(screen_stat.size > 1024);
+
+    var loaded = try persisted_scrollback.load(testing.allocator, session_path, .{ .scrollback = 1024 });
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 24), loaded.primary.rows.len - loaded.scrollback_rows);
+    try testing.expect(screenDataContainsAscii(&loaded.primary, "row-39"));
 }
 
 test "persisted scrollback capture rewrites after resize reflow" {
@@ -1876,7 +1931,7 @@ test "persisted scrollback capture rewrites after resize reflow" {
 
     try io.flushPersistedScrollback();
 
-    var loaded = try persisted_scrollback.load(testing.allocator, session_path, 64 * 1024);
+    var loaded = try persisted_scrollback.load(testing.allocator, session_path, .{ .scrollback = 64 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try expectScreenDataEqual(&expected, &loaded.primary);

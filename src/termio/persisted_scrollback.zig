@@ -16,6 +16,21 @@ const header_size: usize = 22;
 const screen_prefix_size: usize = 14;
 const scrollback_record_prefix_size: usize = 12;
 
+/// Screen state is structurally bounded by terminal dimensions, not by the
+/// user-facing scrollback log cap. Four MiB covers large visible screens while
+/// still preventing unbounded reads from damaged or hostile session dirs.
+pub const screen_file_max_size: usize = 4 * 1024 * 1024;
+
+pub const Limits = struct {
+    /// `scrollback-snapshot-limit` caps the on-disk scrollback log file only.
+    /// Screen, header, and metadata files have internal hard caps appropriate
+    /// to their structure, independent of user config.
+    scrollback: usize,
+    screen: usize = screen_file_max_size,
+    header: usize = 4096,
+    metadata: usize = 64 * 1024,
+};
+
 pub const Header = struct {
     timestamp: i64,
     cols: u16,
@@ -167,16 +182,16 @@ pub fn publishWithProgress(
 pub fn load(
     alloc: Allocator,
     session_dir: []const u8,
-    max_per_file: usize,
+    limits: Limits,
 ) (Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError || snapshot.Error || Error)!Loaded {
     var dir = try openSessionDir(session_dir);
     defer dir.close();
 
-    const header_raw = try readFileAllocDir(alloc, &dir, "header", max_per_file);
+    const header_raw = try readFileAllocDir(alloc, &dir, "header", limits.header);
     defer alloc.free(header_raw);
     const header = try readHeader(header_raw);
 
-    const metadata = readMetadataFile(alloc, &dir, max_per_file) catch |err| switch (err) {
+    const metadata = readMetadataFile(alloc, &dir, limits.metadata) catch |err| switch (err) {
         error.FileNotFound => MetadataOwned{},
         else => return err,
     };
@@ -185,10 +200,12 @@ pub fn load(
     var builder: ScreenBuilder = try .init(alloc, header.cols);
     errdefer builder.deinit(alloc);
 
-    const scrollback_info = try readScrollback(alloc, &dir, max_per_file, &builder);
+    // `scrollback-snapshot-limit` caps this append-only log only. Active screen
+    // files are separate components with structural hard caps.
+    const scrollback_info = try readScrollback(alloc, &dir, limits.scrollback, &builder);
     const scrollback_rows = builder.rowCount();
 
-    const screen_raw = try readFileAllocDir(alloc, &dir, "screen", max_per_file);
+    const screen_raw = try readFileAllocDir(alloc, &dir, "screen", limits.screen);
     defer alloc.free(screen_raw);
     var screen_file = try readScreenFile(alloc, screen_raw);
     errdefer screen_file.deinit(alloc);
@@ -205,7 +222,7 @@ pub fn load(
 
     var alternate: ?snapshot.ScreenData = null;
     var max_seq = @max(scrollback_info.tail_seq, screen_file.seq);
-    if (readFileAllocDir(alloc, &dir, "screen.alt", max_per_file)) |alt_raw| {
+    if (readFileAllocDir(alloc, &dir, "screen.alt", limits.screen)) |alt_raw| {
         defer alloc.free(alt_raw);
         var alt_file = try readScreenFile(alloc, alt_raw);
         errdefer alt_file.deinit(alloc);
@@ -861,7 +878,7 @@ test "persisted scrollback binary snapshot roundtrip" {
         .screen_seq = 23,
     });
 
-    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expectEqual(@as(u16, 80), loaded.header.cols);
@@ -896,7 +913,7 @@ test "load returns full screen when scrollback is empty" {
     });
     try tmp.dir.writeFile(.{ .sub_path = "session/scrollback", .data = "" });
 
-    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 0), loaded.scrollback_rows);
@@ -921,7 +938,7 @@ test "persisted scrollback load rejects old GSRM format" {
     const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
     defer testing.allocator.free(session_path);
 
-    try testing.expectError(error.InvalidSnapshot, load(testing.allocator, session_path, 1024));
+    try testing.expectError(error.InvalidSnapshot, load(testing.allocator, session_path, .{ .scrollback = 1024 }));
 }
 
 test "persisted scrollback load rejects broken file" {
@@ -936,7 +953,7 @@ test "persisted scrollback load rejects broken file" {
     const session_path = try tmp.dir.realpathAlloc(testing.allocator, "session");
     defer testing.allocator.free(session_path);
 
-    try testing.expectError(error.InvalidSnapshot, load(testing.allocator, session_path, 1024));
+    try testing.expectError(error.InvalidSnapshot, load(testing.allocator, session_path, .{ .scrollback = 1024 }));
 }
 
 test "persisted scrollback publish overwrites old file" {
@@ -967,7 +984,7 @@ test "persisted scrollback publish overwrites old file" {
         .screen_seq = 24,
     });
 
-    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expectEqual(@as(i64, 2), loaded.header.timestamp);
@@ -1007,7 +1024,7 @@ test "publish replaces header when dimensions change" {
         .screen_seq = 4,
     });
 
-    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expectEqual(@as(u16, 40), loaded.header.cols);
@@ -1103,7 +1120,7 @@ test "publish skips scrollback records already advanced on disk" {
     try testing.expectEqual(size_after_partial, progress.scrollback_size_after);
     try testing.expectEqual(size_after_partial, try fileSize(&dir, "scrollback"));
 
-    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), loaded.scrollback_rows);
@@ -1176,7 +1193,7 @@ test "seq-number reconciliation drops duplicate screen rows during load" {
         .screen_seq = 3,
     });
 
-    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 4), loaded.primary.rows.len);
@@ -1203,7 +1220,7 @@ test "load on missing scrollback file returns empty scrollback" {
         .screen_seq = 2,
     });
 
-    var loaded = try load(testing.allocator, session_path, 10 * 1024 * 1024);
+    var loaded = try load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 });
     defer loaded.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 0), loaded.scrollback_rows);
@@ -1236,7 +1253,7 @@ test "load rejects mismatched seq monotonicity" {
     std.mem.writeInt(u64, data.writer.buffer[scrollback_record_prefix_size + screen.len ..][0..8], 1, .big);
     try tmp.dir.writeFile(.{ .sub_path = "session/scrollback", .data = data.writer.buffer[0..data.writer.end] });
 
-    try testing.expectError(error.InvalidSnapshot, load(testing.allocator, session_path, 10 * 1024 * 1024));
+    try testing.expectError(error.InvalidSnapshot, load(testing.allocator, session_path, .{ .scrollback = 10 * 1024 * 1024 }));
 }
 
 test "publish creates session dir tree if missing" {
